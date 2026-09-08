@@ -30,6 +30,115 @@ pub struct SuperData {
     pub devices: Vec<BlockDevice>,
 }
 
+/// Map a partition suffix (`a`/`b`) to a metadata slot index
+/// (AOSP convention: slot 0 <-> `_a`, slot 1 <-> `_b`).
+pub fn suffix_to_slot(suffix: &str) -> Option<u64> {
+    match suffix {
+        "a" | "A" => Some(0),
+        "b" | "B" => Some(1),
+        _ => None,
+    }
+}
+
+/// Map a metadata slot index back to its conventional suffix.
+pub fn slot_to_suffix(slot: u64) -> Option<&'static str> {
+    match slot {
+        0 => Some("a"),
+        1 => Some("b"),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_super_data(
+    image_format: String,
+    image_size: u64,
+    geometry: Geometry,
+    geometry_offset: u64,
+    header: MetadataHeader,
+    metadata_offset: u64,
+    metadata_slot: u64,
+    parser: &LpParser,
+    image: &mut Image,
+) -> Result<SuperData> {
+    let partitions = parser.read_partitions(image, &header, metadata_offset)?;
+    let extents = parser.read_extents(image, &header, metadata_offset)?;
+    let groups = parser.read_groups(image, &header, metadata_offset)?;
+    let devices = parser.read_block_devices(image, &header, metadata_offset)?;
+    Ok(SuperData {
+        image_format,
+        image_size,
+        geometry,
+        geometry_offset,
+        header,
+        metadata_offset,
+        metadata_slot,
+        partitions,
+        extents,
+        groups,
+        devices,
+    })
+}
+
+/// Load one explicit metadata slot (primary then backup of that slot).
+pub fn load_super_in_slot(path: &Path, slot: u64) -> Result<SuperData> {
+    let mut image = Image::open(path)?;
+    let format_name = image.format_name().to_string();
+    let image_size = image.size();
+    let parser = LpParser::new();
+    let (geometry, geometry_offset) = parser.find_geometry(&mut image)?;
+    let (header, metadata_offset) = parser.find_metadata_for_slot(&mut image, &geometry, slot)?;
+    build_super_data(
+        format_name,
+        image_size,
+        geometry,
+        geometry_offset,
+        header,
+        metadata_offset,
+        slot,
+        &parser,
+        &mut image,
+    )
+}
+
+/// Load every valid metadata slot (e.g. slot 0 `_a` + slot 1 `_b` on
+/// shiba). Returns slots in index order. Errors only when no slot
+/// validates at all.
+pub fn load_super_all(path: &Path) -> Result<Vec<SuperData>> {
+    let mut image = Image::open(path)?;
+    let format_name = image.format_name().to_string();
+    let image_size = image.size();
+    let parser = LpParser::new();
+    let (geometry, geometry_offset) = parser.find_geometry(&mut image)?;
+    let found = parser.find_all_metadata(&mut image, &geometry);
+    if found.is_empty() {
+        return Err(Error::NotFound(
+            "LP metadata header not found (all primary+backup slots invalid)".into(),
+        ));
+    }
+    let mut out = Vec::with_capacity(found.len());
+    for (slot, header, metadata_offset) in found {
+        let partitions = parser.read_partitions(&mut image, &header, metadata_offset)?;
+        let extents = parser.read_extents(&mut image, &header, metadata_offset)?;
+        let groups = parser.read_groups(&mut image, &header, metadata_offset)?;
+        let devices = parser.read_block_devices(&mut image, &header, metadata_offset)?;
+        out.push(SuperData {
+            image_format: format_name.clone(),
+            image_size,
+            geometry: geometry.clone(),
+            geometry_offset,
+            header,
+            metadata_offset,
+            metadata_slot: slot,
+            partitions,
+            extents,
+            groups,
+            devices,
+        });
+    }
+    Ok(out)
+}
+
 pub fn load_super(path: &Path) -> Result<SuperData> {
     let mut image = Image::open(path)?;
     let format_name = image.format_name().to_string();
