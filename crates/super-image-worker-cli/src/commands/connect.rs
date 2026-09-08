@@ -1,7 +1,54 @@
+use super::split_util;
 use clap::Args;
-use super_image_worker_core::{LP_SECTOR_SIZE, load_super};
+use super_image_worker_core::LP_SECTOR_SIZE;
 use std::ffi::CString;
 use std::path::PathBuf;
+
+/// Resolve the loop device node for a given number.
+/// Stock Linux uses `/dev/loopN`; Android exposes loops as
+/// `/dev/block/loopN` (shiba has 54 there and no `/dev/loopN` nodes).
+/// Prefer whichever node exists, falling back to `/dev/block/loopN`.
+fn loop_node(nr: i32) -> String {
+    let a = format!("/dev/loop{nr}");
+    if std::path::Path::new(&a).exists() {
+        return a;
+    }
+    let b = format!("/dev/block/loop{nr}");
+    if std::path::Path::new(&b).exists() {
+        return b;
+    }
+    // Default to the Linux path when neither exists yet (loop-control
+    // may still allocate it on demand).
+    a
+}
+
+fn open_loop_node(nr: i32, flags: i32) -> i32 {
+    let primary = loop_node(nr);
+    let c = match CString::new(primary.as_str()) {
+        Ok(c) => c,
+        Err(_) => return -1,
+    };
+    let fd = unsafe { libc::open(c.as_ptr(), flags) };
+    if fd >= 0 {
+        return fd;
+    }
+    // Try the alternate prefix before giving up.
+    let alt = if primary.starts_with("/dev/block/loop") {
+        format!("/dev/loop{nr}")
+    } else {
+        format!("/dev/block/loop{nr}")
+    };
+    let c2 = match CString::new(alt.as_str()) {
+        Ok(c) => c,
+        Err(_) => return -1,
+    };
+    unsafe { libc::open(c2.as_ptr(), flags) }
+}
+
+fn backing_file_for(nr: i32) -> Option<String> {
+    let path = format!("/sys/block/loop{nr}/loop/backing_file");
+    std::fs::read_to_string(&path).ok().map(|s| s.trim().to_string())
+}
 
 const LOOP_CTL_GET_FREE: u64 = 0x4C82;
 const LOOP_SET_FD: u64 = 0x4C00;
@@ -119,16 +166,39 @@ fn get_free_loop() -> Result<i32, String> {
             std::io::Error::last_os_error()
         ));
     }
+    let dev_nr = dev_nr as i32;
 
-    Ok(dev_nr as i32)
+    // LOOP_CTL_GET_FREE may return an index with no device node yet
+    // (shiba pre-creates only /dev/block/loop0..53; GET_FREE returned 54
+    // with no node). Prefer the hint when its node exists, otherwise
+    // scan existing nodes for a free one.
+    let hint_node = loop_node(dev_nr);
+    if std::path::Path::new(&hint_node).exists() {
+        return Ok(dev_nr);
+    }
+    for nr in 0..256 {
+        let node = loop_node(nr);
+        if !std::path::Path::new(&node).exists() {
+            continue;
+        }
+        // Free when no backing file (or status query fails).
+        let bf = format!("/sys/block/loop{nr}/loop/backing_file");
+        match std::fs::read_to_string(&bf) {
+            Ok(content) if !content.trim().is_empty() => continue,
+            _ => return Ok(nr),
+        }
+    }
+    // No existing free node; return the hint and let the caller report
+    // the missing node clearly.
+    Ok(dev_nr)
 }
 
 fn setup_loop(dev_nr: i32, image_fd: i32, offset: u64, size: u64) -> Result<(), String> {
-    let loop_path = CString::new(format!("/dev/loop{dev_nr}")).unwrap();
-    let loop_fd = unsafe { libc::open(loop_path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    let loop_fd = open_loop_node(dev_nr, libc::O_RDWR | libc::O_CLOEXEC);
     if loop_fd < 0 {
         return Err(format!(
-            "failed to open /dev/loop{dev_nr}: {}",
+            "failed to open {}: {}",
+            loop_node(dev_nr),
             std::io::Error::last_os_error()
         ));
     }
@@ -155,6 +225,7 @@ fn setup_loop(dev_nr: i32, image_fd: i32, offset: u64, size: u64) -> Result<(), 
     Ok(())
 }
 
+#[allow(clippy::collapsible_if)]
 fn find_loop_for_partition(image_path: &str, offset: u64, size: u64) -> Result<i32, String> {
     let abs_path =
         std::fs::canonicalize(image_path).map_err(|e| format!("failed to resolve path: {e}"))?;
@@ -162,8 +233,7 @@ fn find_loop_for_partition(image_path: &str, offset: u64, size: u64) -> Result<i
     let abs_deleted = format!("{abs_str} (deleted)");
 
     for nr in 0..256 {
-        let loop_path = CString::new(format!("/dev/loop{nr}")).unwrap();
-        let loop_fd = unsafe { libc::open(loop_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        let loop_fd = open_loop_node(nr, libc::O_RDONLY | libc::O_CLOEXEC);
         if loop_fd < 0 {
             continue;
         }
@@ -177,9 +247,7 @@ fn find_loop_for_partition(image_path: &str, offset: u64, size: u64) -> Result<i
         }
 
         if info.lo_offset == offset && info.lo_sizelimit == size {
-            let backing_file = format!("/sys/block/loop{nr}/loop/backing_file");
-            if let Ok(content) = std::fs::read_to_string(&backing_file) {
-                let backing_path = content.trim();
+            if let Some(backing_path) = backing_file_for(nr) {
                 if backing_path == abs_str || backing_path == abs_deleted {
                     return Ok(loop_fd);
                 }
@@ -194,42 +262,12 @@ fn find_loop_for_partition(image_path: &str, offset: u64, size: u64) -> Result<i
     ))
 }
 
-fn resolve_partition(
-    data: &super_image_worker_core::SuperData,
-    name: &str,
-    slot: &str,
-) -> Result<super_image_worker_core::Partition, String> {
-    let slot_filter = match slot {
-        "a" | "A" => Some("a"),
-        "b" | "B" => Some("b"),
-        "all" => None,
-        other => return Err(format!("unknown slot: {other} (use a, b, all)")),
-    };
-
-    let candidates: Vec<&super_image_worker_core::Partition> = data
-        .partitions
-        .iter()
-        .filter(|p| {
-            if p.name != name && super_image_worker_core::SuperData::strip_suffix(&p.name) != name {
-                return false;
-            }
-            if let Some(sfx) = slot_filter {
-                super_image_worker_core::SuperData::find_suffix(&p.name).is_none_or(|s| s == sfx)
-            } else {
-                true
-            }
-        })
-        .collect();
-
-    match candidates.len() {
-        0 => Err(format!("partition '{name}' not found")),
-        1 => Ok(candidates[0].clone()),
-        _ => {
-            let names: Vec<&str> = candidates.iter().map(|p| p.name.as_str()).collect();
-            Err(format!(
-                "ambiguous name '{name}', matches: {names:?}. Use full name or --slot"
-            ))
-        }
+fn parse_slot_filter(slot: &str) -> Result<Option<&str>, String> {
+    match slot {
+        "a" | "A" => Ok(Some("a")),
+        "b" | "B" => Ok(Some("b")),
+        "all" => Ok(None),
+        other => Err(format!("unknown slot: {other} (use a, b, all)")),
     }
 }
 
@@ -239,18 +277,39 @@ pub fn run_connect(args: ConnectArgs) -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
-    let data = match load_super(&args.image) {
-        Ok(d) => d,
+    let slot_filter = match parse_slot_filter(&args.slot) {
+        Ok(s) => s,
         Err(e) => {
             eprintln!("error: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
-
-    let p = match resolve_partition(&data, &args.partition, &args.slot) {
-        Ok(p) => p,
+    let datas = match split_util::load_for_slot_filter(&args.image, slot_filter) {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("error: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let (slot_pos, part_idx) =
+        match split_util::find_partition_across(&datas, &args.partition, slot_filter) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+    let data = match datas.get(slot_pos) {
+        Some(d) => d,
+        None => {
+            eprintln!("error: metadata slot not found");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let p = match data.partitions.get(part_idx).cloned() {
+        Some(p) => p,
+        None => {
+            eprintln!("error: invalid partition index");
             return std::process::ExitCode::FAILURE;
         }
     };
@@ -335,7 +394,7 @@ pub fn run_connect(args: ConnectArgs) -> std::process::ExitCode {
         }
 
         libc::close(image_fd);
-        println!("/dev/loop{dev_nr}");
+        println!("{}", loop_node(dev_nr));
     }
 
     std::process::ExitCode::SUCCESS
@@ -347,18 +406,39 @@ pub fn run_disconnect(args: DisconnectArgs) -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
-    let data = match load_super(&args.image) {
-        Ok(d) => d,
+    let slot_filter = match parse_slot_filter(&args.slot) {
+        Ok(s) => s,
         Err(e) => {
             eprintln!("error: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
-
-    let p = match resolve_partition(&data, &args.partition, &args.slot) {
-        Ok(p) => p,
+    let datas = match split_util::load_for_slot_filter(&args.image, slot_filter) {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("error: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let (slot_pos, part_idx) =
+        match split_util::find_partition_across(&datas, &args.partition, slot_filter) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+    let data = match datas.get(slot_pos) {
+        Some(d) => d,
+        None => {
+            eprintln!("error: metadata slot not found");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let p = match data.partitions.get(part_idx).cloned() {
+        Some(p) => p,
+        None => {
+            eprintln!("error: invalid partition index");
             return std::process::ExitCode::FAILURE;
         }
     };
