@@ -1,6 +1,6 @@
 use super::split_util;
 use clap::Args;
-use super_image_worker_core::{Image, extract_partition, extract_partition_split, load_super};
+use super_image_worker_core::{Image, extract_partition, extract_partition_split};
 use rayon::prelude::*;
 use std::fs;
 use std::io::BufWriter;
@@ -66,14 +66,6 @@ pub struct ExtractArgs {
 }
 
 pub fn run(args: ExtractArgs) -> std::process::ExitCode {
-    let data = match load_super(&args.image) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-
     let slot = match args.slot.as_str() {
         "a" | "A" => Some("a"),
         "b" | "B" => Some("b"),
@@ -84,26 +76,40 @@ pub fn run(args: ExtractArgs) -> std::process::ExitCode {
         }
     };
 
-    // Resolve partition list (supports base name + slot).
-    let names: Vec<String> = if let Some(ref name) = args.partition {
-        match data.resolve_partition(name, slot) {
-            Ok(idx) => vec![
-                data.partitions
-                    .get(idx)
-                    .map(|p| p.name.clone())
-                    .unwrap_or_default(),
-            ],
+    // Slot-aware loading: `-s b` extracts from metadata slot 1,
+    // `-s all` from every valid slot (dual-slot images).
+    let datas = match split_util::load_for_slot_filter(&args.image, slot) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
+    // Resolve partition list (supports base name + slot, across slots).
+    // Each entry tracks its owning metadata slot for correct extents.
+    let mut names: Vec<(usize, String)> = Vec::new();
+    if let Some(ref name) = args.partition {
+        match split_util::find_partition_across(&datas, name, slot) {
+            Ok((di, pi)) => {
+                if let Some(p) = datas.get(di).and_then(|d| d.partitions.get(pi)) {
+                    names.push((di, p.name.clone()));
+                }
+            }
             Err(e) => {
                 eprintln!("error: {e}");
                 return std::process::ExitCode::FAILURE;
             }
         }
     } else {
-        data.filter_by_slot(slot)
-            .iter()
-            .map(|p| p.name.clone())
-            .collect()
-    };
+        for (di, data) in datas.iter().enumerate() {
+            // Suffix filter still applies inside each slot (mixed slots
+            // hold both `_a` and empty `_b` placeholders).
+            for p in data.filter_by_slot(slot) {
+                names.push((di, p.name.clone()));
+            }
+        }
+    }
 
     if names.is_empty() {
         eprintln!("no partitions to extract");
@@ -117,7 +123,11 @@ pub fn run(args: ExtractArgs) -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
-    for name in &names {
+    for (di, name) in &names {
+        let data = match datas.get(*di) {
+            Some(d) => d,
+            None => continue,
+        };
         if let Some(p) = data.partitions.iter().find(|p| p.name == *name) {
             let size = data.partition_size(p);
             if args.dry_run {
@@ -137,11 +147,14 @@ pub fn run(args: ExtractArgs) -> std::process::ExitCode {
         return std::process::ExitCode::SUCCESS;
     }
 
-    let split = data.devices.len() > 1 || !args.device.is_empty();
+    // Split detection across all loaded slots (any multi-device slot
+    // forces the multiblock path; bindings resolve against slot 0 layout).
+    let split = datas.iter().any(|d| d.devices.len() > 1) || !args.device.is_empty();
     // Pre-resolve split bindings once; rayon threads only open files.
     let mut bindings: Vec<(u32, PathBuf)> = Vec::new();
     if split {
-        match super_image_worker_core::resolve_device_bindings(&data.devices, &args.device, &args.image) {
+        let ref_data = &datas[0];
+        match super_image_worker_core::resolve_device_bindings(&ref_data.devices, &args.device, &args.image) {
             Ok(map) => {
                 bindings = map.into_iter().collect();
                 bindings.sort_by_key(|(i, _)| *i);
@@ -160,7 +173,11 @@ pub fn run(args: ExtractArgs) -> std::process::ExitCode {
         extents: Vec<super_image_worker_core::Extent>,
     }
     let mut jobs: Vec<Job> = Vec::new();
-    for name in &names {
+    for (di, name) in &names {
+        let data = match datas.get(*di) {
+            Some(d) => d,
+            None => continue,
+        };
         let part_idx = match data.partitions.iter().position(|x| x.name == *name) {
             Some(i) => i,
             None => continue,
@@ -173,7 +190,7 @@ pub fn run(args: ExtractArgs) -> std::process::ExitCode {
         if out_path.exists() && !args.force {
             continue;
         }
-        let extents = match split_util::partition_extents(&data, part_idx) {
+        let extents = match split_util::partition_extents(data, part_idx) {
             Ok(e) => e,
             Err(e) => {
                 eprintln!("error: {e}");
