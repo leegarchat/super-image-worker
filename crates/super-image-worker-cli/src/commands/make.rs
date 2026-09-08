@@ -6,7 +6,8 @@ use super_image_worker_core::{
 };
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 
 #[derive(Args)]
@@ -39,10 +40,18 @@ SPEC FORMATS (repeatable flags):\n\
   --group name:max_size                              (e.g. default:4G)\n\
   --partition name:attrs:group[:payload_path]        (attrs: comma list of\n\
            readonly, slot_suffixed, updated, disabled, none)\n\
+  --partition name:attrs:group@device:payload_path  pins the payload to one\n\
+           split device (single extent, fails if it does not fit there)\n\
   Sizes accept K/M/G suffixes (e.g. 300M, 1G, 64K). Names are capped at 36\n\
   bytes. A partition without payload becomes an extent-less placeholder.\n\n\
-OUTPUTS: single mode writes exactly -o PATH (one device required). Retrofit\n\
-mode (--retrofit, 2+ devices) writes <PREFIX>_<device>.img per device.\n\
+OUTPUTS: single mode writes exactly -o PATH (one device required); PATH may\n\
+be a regular file or a raw block device (e.g. /dev/block/by-name/super),\n\
+in which case the image is built straight into the block node (the\n\
+--device size must equal the probed block size, and --sparse is refused\n\
+for block outputs). Retrofit mode (--retrofit, 2+ devices) writes\n\
+<PREFIX>_<device>.img per device, unless --output-map <name>=<path>\n\
+overrides individual outputs (files or block devices, so a split image\n\
+can target several block nodes at once: super, cust, modem_a, ...).\n\
 --sparse converts each raw file to an Android Sparse container with RAW +\n\
 DONT_CARE chunks (staging *.raw-tmp files are removed afterwards).\n\n\
 EXAMPLES:\n\
@@ -99,6 +108,13 @@ pub struct MakeArgs {
     #[arg(long)]
     pub retrofit: bool,
 
+    /// Override the output path of one block device (repeatable).
+    /// Form: `--output-map <device-name>=<path>`; path may be a regular
+    /// file or a raw block device. Unmapped devices fall back to
+    /// `<prefix>_<device>.img` (retrofit) or `-o` (single mode).
+    #[arg(long = "output-map")]
+    pub output_map: Vec<String>,
+
     /// Emit Android Sparse container(s) instead of raw.
     #[arg(long)]
     pub sparse: bool,
@@ -123,6 +139,8 @@ struct PartitionSpec {
     name: String,
     attrs: u32,
     group: String,
+    /// Optional split-device pin from `group@device` syntax.
+    pin: Option<String>,
     payload: Option<PathBuf>,
     payload_len: u64,
 }
@@ -230,6 +248,21 @@ fn parse_partition_spec(s: &str) -> Result<PartitionSpec, String> {
         return Err(format!("partition name too long: '{name}'"));
     }
     let attrs = parse_attrs(attrs_s.trim())?;
+    // Optional `@device` pin on the group field (split layouts).
+    let (group, pin) = match group.split_once('@') {
+        Some((g, d)) => {
+            let g = g.trim().to_string();
+            let d = d.trim().to_string();
+            if g.is_empty() || d.is_empty() {
+                return Err(format!("invalid --partition '{s}' (want group[@device])"));
+            }
+            if d.len() > 36 {
+                return Err(format!("device name too long in '{s}'"));
+            }
+            (g, Some(d))
+        }
+        None => (group, None),
+    };
     let (payload, payload_len) = match parts.next() {
         Some(p) if !p.trim().is_empty() => {
             let pb = PathBuf::from(p.trim());
@@ -245,9 +278,55 @@ fn parse_partition_spec(s: &str) -> Result<PartitionSpec, String> {
         name,
         attrs,
         group,
+        pin,
         payload,
         payload_len,
     })
+}
+
+/// True when `path` resolves to a raw block device (symlinks followed,
+/// so /dev/block/by-name/* entries count).
+fn is_block_device_path(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.file_type().is_block_device())
+        .unwrap_or(false)
+}
+
+/// Probe the byte size of a block device via SEEK_END (metadata reports
+/// 0 for block nodes). Restores the cursor to 0.
+fn probe_block_size(path: &Path) -> Result<u64, String> {
+    let mut f =
+        File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let end = f
+        .seek(SeekFrom::End(0))
+        .map_err(|e| format!("seek end {}: {e}", path.display()))?;
+    f.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("seek start {}: {e}", path.display()))?;
+    if end == 0 {
+        return Err("probed size is 0".into());
+    }
+    Ok(end)
+}
+
+/// Zero-fill `size` bytes of an open block node in 4 MiB chunks, so a
+/// direct-to-block build starts from the same blank slate as a fresh
+/// output file (no stale payload/metadata in gaps or free space).
+fn zero_fill(handle: &mut File, size: u64) -> Result<(), String> {
+    use std::io::Seek as _;
+    handle
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| format!("seek start for zero-fill: {e}"))?;
+    let zeros = vec![0u8; 4 * 1024 * 1024];
+    let mut remaining = size;
+    while remaining > 0 {
+        let n = remaining.min(zeros.len() as u64) as usize;
+        handle
+            .write_all(&zeros[..n])
+            .map_err(|e| format!("zero-fill write: {e}"))?;
+        remaining -= n as u64;
+    }
+    handle.flush().map_err(|e| format!("zero-fill flush: {e}"))?;
+    Ok(())
 }
 
 fn parse_slots(s: &str, slot_count: u32) -> Result<Vec<u64>, String> {
@@ -419,11 +498,43 @@ fn run_inner(args: MakeArgs) -> std::result::Result<(), String> {
                     max / LP_SECTOR_SIZE
                 ));
             }
-            // Spanning plan: single extent when the payload fits on one
-            // device, otherwise a per-device extent chain.
-            let plan = writer
-                .plan_spanning_allocation(&extents, &devices, needed)
-                .map_err(|e| format!("partition '{}': {e}", spec.name))?;
+            // Pinned partitions go to one explicit device as a single
+            // extent (fails if they do not fit there); unpinned ones
+            // use the spanning plan (single extent on one device when
+            // it fits, otherwise a per-device extent chain).
+            let plan = match spec.pin.as_deref() {
+                Some(pin_name) => {
+                    let pinned = devices
+                        .iter()
+                        .position(|d| d.partition_name == pin_name)
+                        .ok_or_else(|| {
+                            let known: Vec<&str> = devices
+                                .iter()
+                                .map(|d| d.partition_name.as_str())
+                                .collect();
+                            format!(
+                                "partition '{}': pinned device '{pin_name}' is not a --device (known: {known:?})",
+                                spec.name
+                            )
+                        })? as u32;
+                    let sector = writer
+                        .find_free_sectors(&extents, &devices, pinned, needed)
+                        .map_err(|e| {
+                            format!(
+                                "partition '{}': pinned to '{pin_name}': {e}",
+                                spec.name
+                            )
+                        })?;
+                    println!(
+                        "  partition '{}': pinned to device '{pin_name}' ({needed} sectors at {sector})",
+                        spec.name,
+                    );
+                    vec![(pinned, sector, needed)]
+                }
+                None => writer
+                    .plan_spanning_allocation(&extents, &devices, needed)
+                    .map_err(|e| format!("partition '{}': {e}", spec.name))?,
+            };
             if plan.len() > 1 {
                 println!(
                     "  partition '{}': payload spans {} devices ({} extents)",
@@ -480,18 +591,50 @@ fn run_inner(args: MakeArgs) -> std::result::Result<(), String> {
         }
     }
 
-    // Output file plan.
+    // Explicit per-device output overrides: --output-map name=path.
+    let mut output_overrides: HashMap<String, PathBuf> = HashMap::new();
+    for spec in &args.output_map {
+        let (name, path_str) = spec
+            .split_once('=')
+            .ok_or_else(|| format!("invalid --output-map '{spec}' (want name=path)"))?;
+        let name = name.trim().to_string();
+        let path_str = path_str.trim();
+        if name.is_empty() || path_str.is_empty() {
+            return Err(format!("invalid --output-map '{spec}' (want name=path)"));
+        }
+        if !dev_specs.iter().any(|d| d.name == name) {
+            let known: Vec<&str> = dev_specs.iter().map(|d| d.name.as_str()).collect();
+            return Err(format!(
+                "--output-map device '{name}' is not a --device (known: {known:?})"
+            ));
+        }
+        if output_overrides.insert(name.clone(), PathBuf::from(path_str)).is_some() {
+            return Err(format!("--output-map device '{name}' given twice"));
+        }
+    }
+
+    // Output file plan (one path per block device, table order).
     let out_files: Vec<PathBuf> = if split_out {
         dev_specs
             .iter()
             .map(|d| {
+                if let Some(p) = output_overrides.get(&d.name) {
+                    return p.clone();
+                }
                 let prefix = args.output.to_string_lossy().into_owned();
                 PathBuf::from(format!("{prefix}_{}.img", d.name))
             })
             .collect()
     } else {
-        vec![args.output.clone()]
+        vec![output_overrides
+            .values()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| args.output.clone())]
     };
+    if !split_out && output_overrides.len() > 1 {
+        return Err("--output-map with several devices requires --retrofit".into());
+    }
     // Raw staging paths (final when !sparse).
     let raw_files: Vec<PathBuf> = if args.sparse {
         out_files
@@ -505,6 +648,33 @@ fn run_inner(args: MakeArgs) -> std::result::Result<(), String> {
         out_files.clone()
     };
 
+    // Detect block-device outputs and validate them BEFORE the dry-run
+    // exit, so bad plans fail fast: sparse is refused for blocks, and
+    // every --device size must equal the probed block size exactly.
+    let mut is_block_out: Vec<bool> = Vec::with_capacity(out_files.len());
+    for path in out_files.iter() {
+        is_block_out.push(is_block_device_path(path));
+    }
+    if args.sparse && is_block_out.iter().any(|b| *b) {
+        return Err("sparse output to a block device is not supported (build raw directly)".into());
+    }
+    for (i, dev) in dev_specs.iter().enumerate() {
+        if !is_block_out[i] {
+            continue;
+        }
+        let probed = probe_block_size(&out_files[i])
+            .map_err(|e| format!("probe {}: {e}", out_files[i].display()))?;
+        if dev.size != probed {
+            return Err(format!(
+                "device '{}' size mismatch: spec {} != block {} {} (pass the exact block size)",
+                dev.name,
+                dev.size,
+                probed,
+                out_files[i].display()
+            ));
+        }
+    }
+
     // Dry run: print the plan.
     if args.dry_run {
         println!(
@@ -515,7 +685,15 @@ fn run_inner(args: MakeArgs) -> std::result::Result<(), String> {
             if args.sparse { "sparse" } else { "raw" }
         );
         for (d, f) in dev_specs.iter().zip(out_files.iter()) {
-            println!("  device {} size={} -> {}", d.name, d.size, f.display());
+            let kind = if is_block_device_path(f) {
+                let probed = probe_block_size(f)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|e| format!("ERR:{e}"));
+                format!("block (probed {probed})")
+            } else {
+                "file".to_string()
+            };
+            println!("  device {} size={} -> {} [{kind}]", d.name, d.size, f.display());
         }
         for (pi, payload, in_off, len, src, sector) in &payload_jobs {
             let pname = partitions.get(*pi).map(|p| p.name.as_str()).unwrap_or("?");
@@ -528,17 +706,47 @@ fn run_inner(args: MakeArgs) -> std::result::Result<(), String> {
         return Ok(());
     }
 
-    // Create + size output files.
+    // Create + size output files (is_block_out validated above).
+    // NOTE: --sparse uses .raw-tmp staging files, never block nodes
+    // (refused above), so raw_files == out_files whenever any output
+    // is a block device.
     if let Some(parent) = args.output.parent()
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent).map_err(|e| format!("create output dir: {e}"))?;
     }
+    // Per-file parent dirs for --output-map paths living elsewhere.
+    for (path, is_block) in raw_files.iter().zip(is_block_out.iter()) {
+        if *is_block {
+            continue;
+        }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| format!("create output dir: {e}"))?;
+        }
+    }
     let mut handles: Vec<File> = Vec::new();
-    for (dev, path) in dev_specs.iter().zip(raw_files.iter()) {
-        let f = super_image_worker_core::sparse::create_sized_file(path, dev.size)
-            .map_err(|e| format!("create {}: {e}", path.display()))?;
-        handles.push(f);
+    for (i, dev) in dev_specs.iter().enumerate() {
+        let path = &raw_files[i];
+        let is_block = is_block_out[i];
+        if is_block {
+            // Direct-to-block build (spec == probed size validated above):
+            // open read-write without truncating, then zero-fill to
+            // emulate a fresh output file.
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .map_err(|e| format!("open {}: {e}", path.display()))?;
+            handles.push(f);
+            println!("  zeroing block {} ({} bytes)...", path.display(), dev.size);
+            zero_fill(handles.last_mut().ok_or("no output files")?, dev.size)?;
+        } else {
+            let f = super_image_worker_core::sparse::create_sized_file(path, dev.size)
+                .map_err(|e| format!("create {}: {e}", path.display()))?;
+            handles.push(f);
+        }
     }
 
     // Geometry into device-0 file (primary + backup).
