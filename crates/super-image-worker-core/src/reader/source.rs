@@ -48,10 +48,33 @@ fn u32_le(b: &[u8]) -> Result<u32> {
         .map_err(|_| Error::Invalid("truncated u32 in sparse header".into()))
 }
 
+/// Resolve the effective byte size for a path that may be a regular
+/// file, an Android sparse image, or a raw block device
+/// (`/dev/block/by-name/super`). `File::metadata().len()` returns 0 for
+/// block devices, so fall back to `SEEK_END` (works for both regular
+/// files and block devices on Linux/Android).
+fn effective_size(file: &mut File, meta_len: u64) -> u64 {
+    if meta_len != 0 {
+        return meta_len;
+    }
+    // Block device (or other special file): probe via SEEK_END.
+    let cur = file.stream_position().unwrap_or(0);
+    if let Ok(end) = file.seek(SeekFrom::End(0)) {
+        let _ = file.seek(SeekFrom::Start(cur.min(end)));
+        if end > 0 {
+            return end;
+        }
+    } else {
+        let _ = file.seek(SeekFrom::Start(cur));
+    }
+    meta_len
+}
+
 impl Image {
     pub fn open(path: &Path) -> Result<Self> {
         let mut file = File::open(path)?;
-        let file_size = file.metadata()?.len();
+        let meta_len = file.metadata()?.len();
+        let file_size = effective_size(&mut file, meta_len);
         let mut magic = [0u8; 4];
         if let Err(e) = file.read_exact(&mut magic) {
             return Err(Error::Io(e));
