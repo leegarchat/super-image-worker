@@ -19,6 +19,7 @@
 * **Разделение слот/суффикс**: `-s/--slot` (`0|a`, `1|b`, …, `all`) выбирает, какая копия LP-метаданных используется; `--suffix` (`a|b|all`, только длинный флаг) фильтрует буквы имен внутри нее. Слот метаданных с записями и `_a`, и `_b` читается как `--slot 0 --suffix b`.
 * **Raw-блочные устройства везде**: все команды принимают узлы `/dev/block/by-name/*` напрямую (размер определяется через `SEEK_END`, т.к. метаданные блока сообщают 0).
 * **Legacy однослотовые super**: раскладки без суффиксов (`system`, `vendor`, …) с одним слотом метаданных полностью поддерживаются генерацией и всеми командами чтения/записи.
+* **OTA-снапшот хелперы**: `cow` удаляет `*-cow`-разделы группы `cow` (аналог `lptools --clear-cow`) с гейтом по замапленным девайсам; `snapshot-status` печатает `Update state: <state>` (аналог `snapshotctl dump`) из он-диск стейта снапшотов для ветвлений инсталлера.
 * **Многопоточное извлечение**: параллельный `extract` на `rayon`, у каждого потока изолированный дескриптор образа (гонок `Seek` нет).
 * **CLI для скриптов**: `--slot`/`--suffix` во всех командах, форматы `human`/`json`/`tsv`/`env`, извлечение скаляров через `--get` без завершающего перевода строки, потоковый `read` с `--skip`/`--size` и корректной обработкой `BrokenPipe`.
 
@@ -262,6 +263,25 @@ super-image-worker unmap system_a
 
 Полные цепочки экстентов (linear + zero). На хостовом Linux отказывается работать — там используйте `connect`.
 
+### 12. `cow` — удаление OTA COW-разделов (только raw, root не нужен)
+
+```bash
+super-image-worker cow super.img                          # Удалить *-cow группы `cow` во всех слотах
+super-image-worker cow /dev/block/by-name/super -s 0
+super-image-worker cow super.img --dry-run
+```
+
+Аналог `lptools --clear-cow`. Отказывается работать, пока под `/dev/block/mapper` замаплен хоть один `-cow`-девайс (опасность живого мержа), обход через `--force`; exit 0, даже если удалять нечего.
+
+### 13. `snapshot-status` — состояние OTA-обновления (только чтение, root не нужен)
+
+```bash
+super-image-worker snapshot-status                        # -> Update state: none
+super-image-worker snapshot-status | grep '^Update state:'
+```
+
+Аналог `snapshotctl dump` для ветвлений инсталлера (`none`/`initiated`/`unverified`/`merging`/`merge-completed`/`merge-needs-reboot`/`merge-failed`/`cancelled`): читает `/metadata/ota/state` напрямую (поле #1 proto, fallback на legacy-текст, отсутствие/мусор → `none`). Одна строка в stdout, всегда exit 0.
+
 ---
 
 ## Важные нюансы окружения: переполнение `TMPDIR`
@@ -300,6 +320,8 @@ export TMPDIR=~/ws/tmp
 * Двухслотовый образ Pixel (текущий слот `_b`): `--slot 1 --suffix b` открывает живую таблицу; чтения блока побитово совпадают с файловым дампом (sha256).
 * Сплит super по блочным узлам `super`+`cust`+`modem_a`+`modem_b` (`--output-map`, пины `@device`): сборки в файлы, `dd` в блоки и сборки сразу в блоки читаются одинаково под `lpdump` и `siw`.
 * Legacy однослотовый образ (бессуффиксные `system`/`vendor`, один метаслот): round-trip генерация/чтение/extract/resize/rename проверен.
+* `cow` на живом блоке `super`: no-op на чистой таблице, отказ при замапленном тестовом `-cow`, реальное удаление с кросс-чеком `lpdump`, блок восстановлен с совпадающим sha256.
+* `snapshot-status`: вывод один в один с `snapshotupdater_static dump` плюс crafted proto/legacy/empty/missing-кейсы.
 * `cargo clippy --all-targets -- -D warnings`: чисто. `cargo test`: pass.
 
 ---

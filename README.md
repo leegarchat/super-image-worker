@@ -19,6 +19,7 @@ The utility is completely standalone: for all offline work it requires no superu
 * **Slot vs Suffix Separation**: `-s/--slot` (`0|a`, `1|b`, …, `all`) picks which LP metadata copy is used; `--suffix` (`a|b|all`, long flag only) filters partition name letters inside it. A metadata slot holding both `_a` and `_b` entries reads with `--slot 0 --suffix b`.
 * **Raw Block Devices Everywhere**: Every command accepts `/dev/block/by-name/*` nodes directly as inputs (size probed via `SEEK_END`, since block metadata reports 0).
 * **Legacy Single-Slot Supers**: Slotless layouts (`system`, `vendor`, … without suffix letters, one metadata slot) are fully supported for generation and all read/write commands.
+* **OTA Snapshot Helpers**: `cow` deletes `*-cow` partitions of the `cow` group (`lptools --clear-cow` analog) with a mapped-device merge gate; `snapshot-status` prints `Update state: <state>` (`snapshotctl dump` analog) from the on-disk snapshot state for installer branching.
 * **Multithreaded Extraction**: Parallel `extract` powered by `rayon`, each thread with an isolated image handle (no `Seek` races).
 * **Script-First CLI**: `--slot`/`--suffix` everywhere, `human`/`json`/`tsv`/`env` output formats, `--get` scalar extraction without trailing newlines, streaming `read` with `--skip`/`--size` and graceful `BrokenPipe` handling.
 
@@ -262,6 +263,25 @@ super-image-worker unmap system_a
 
 Full extent chains (linear + zero). Refuses to run on host Linux — use `connect` there.
 
+### 12. `cow` — Delete OTA snapshot COW partitions (raw only, no root)
+
+```bash
+super-image-worker cow super.img                          # Delete *-cow of group `cow`, all slots
+super-image-worker cow /dev/block/by-name/super -s 0
+super-image-worker cow super.img --dry-run
+```
+
+`lptools --clear-cow` analog. Refuses while any `-cow` device is mapped under `/dev/block/mapper` (live merge danger) unless `--force`; exit 0 also when there is nothing to delete.
+
+### 13. `snapshot-status` — OTA update state (read-only, no root)
+
+```bash
+super-image-worker snapshot-status                        # -> Update state: none
+super-image-worker snapshot-status | grep '^Update state:'
+```
+
+`snapshotctl dump` analog for installer branching (`none`/`initiated`/`unverified`/`merging`/`merge-completed`/`merge-needs-reboot`/`merge-failed`/`cancelled`): reads `/metadata/ota/state` directly (proto field #1, legacy text fallback, missing/garbage → `none`). Single stdout line, always exit 0.
+
 ---
 
 ## Critical Environment Notice: `TMPDIR` Exhaustion
@@ -300,6 +320,8 @@ Measured on a 9.0 GiB real-device `super` image (14 partitions, 7 with data):
 * Dual-slot Pixel image (current slot `_b`): `--slot 1 --suffix b` exposes the live table; block reads match the file dump bit-identically (sha256).
 * Split super across `super`+`cust`+`modem_a`+`modem_b` block nodes (`--output-map`, `@device` pins): file builds, `dd` imaging, and direct-to-block builds all read back identically under `lpdump` and `siw`.
 * Legacy single-slot image (slotless `system`/`vendor`, one metadata slot): generate/read/extract/resize/rename round-trip verified.
+* `cow` on a live `super` block: no-op on clean table, refusal while a test `-cow` partition was mapped, real delete with `lpdump` cross-check, block restored with matching sha256.
+* `snapshot-status`: identical output to `snapshotupdater_static dump` plus crafted proto/legacy/empty/missing cases.
 * `cargo clippy --all-targets -- -D warnings`: clean. `cargo test`: pass.
 
 ---
