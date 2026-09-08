@@ -1,6 +1,6 @@
 use super::split_util;
 use clap::Args;
-use super_image_worker_core::{ExtentReader, Image, MultiBlockImage, SplitExtentReader, load_super};
+use super_image_worker_core::{ExtentReader, Image, MultiBlockImage, SplitExtentReader};
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 
@@ -90,14 +90,6 @@ impl<'a> ActiveReader<'a> {
 }
 
 pub fn run(args: ReadArgs) -> std::process::ExitCode {
-    let data = match load_super(&args.image) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-
     let slot = match args.slot.as_str() {
         "a" | "A" => Some("a"),
         "b" | "B" => Some("b"),
@@ -108,15 +100,32 @@ pub fn run(args: ReadArgs) -> std::process::ExitCode {
         }
     };
 
-    let part_idx = match data.resolve_partition(&args.partition, slot) {
-        Ok(i) => i,
+    // Slot-aware: `-S b` reads metadata slot 1, `-S all` searches all
+    // valid slots so `system_b` resolves on dual-slot images.
+    let datas = match split_util::load_for_slot_filter(&args.image, slot) {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("error: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
+    let (slot_pos, part_idx) =
+        match split_util::find_partition_across(&datas, &args.partition, slot) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+    let data = match datas.get(slot_pos) {
+        Some(d) => d,
+        None => {
+            eprintln!("error: metadata slot not found");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
 
-    let extents = match split_util::partition_extents(&data, part_idx) {
+    let extents = match split_util::partition_extents(data, part_idx) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("error: {e}");
@@ -165,7 +174,7 @@ pub fn run(args: ReadArgs) -> std::process::ExitCode {
     let mut image_opt: Option<Image> = None;
     let mut mb_opt: Option<MultiBlockImage> = None;
     if split {
-        match split_util::open_split(&args.image, &args.device, &data) {
+        match split_util::open_split(&args.image, &args.device, data) {
             Ok(mb) => mb_opt = Some(mb),
             Err(e) => {
                 eprintln!("error: {e}");
