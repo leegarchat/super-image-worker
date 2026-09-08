@@ -145,6 +145,61 @@ impl LpParser {
         ))
     }
 
+    /// Load metadata for one explicit slot index: primary copy first,
+    /// then the backup copy of the same slot (AOSP layout).
+    /// Used for `--slot a|b` selection (slot 0 <-> `_a`, 1 <-> `_b`).
+    #[allow(clippy::collapsible_if)]
+    pub fn find_metadata_for_slot(
+        &self,
+        image: &mut Image,
+        geometry: &Geometry,
+        slot: u64,
+    ) -> Result<(MetadataHeader, u64)> {
+        let max = geometry.metadata_max_size as u64;
+        let count = geometry.metadata_slot_count as u64;
+        if slot >= count {
+            return Err(Error::NotFound(format!(
+                "metadata slot {slot} out of range (slot_count {count})"
+            )));
+        }
+        if let Some(off) = primary_offset(slot, max) {
+            if off.saturating_add(0x80) <= image.size() {
+                if let Ok(res) = self.parse_metadata_validated(image, off, geometry) {
+                    return Ok(res);
+                }
+            }
+        }
+        if let Some(off) = backup_offset(slot, count, max) {
+            if off.saturating_add(0x80) <= image.size() {
+                if let Ok(res) = self.parse_metadata_validated(image, off, geometry) {
+                    return Ok(res);
+                }
+            }
+        }
+        Err(Error::NotFound(format!(
+            "LP metadata slot {slot} not found (primary+backup invalid)"
+        )))
+    }
+
+    /// Collect every valid metadata slot (slot index, header, offset).
+    /// Invalid/empty slots (e.g. unused slot 2 on 3-slot geometries)
+    /// are skipped.
+    pub fn find_all_metadata(
+        &self,
+        image: &mut Image,
+        geometry: &Geometry,
+    ) -> Vec<(u64, MetadataHeader, u64)> {
+        let count = geometry.metadata_slot_count as u64;
+        let mut out = Vec::new();
+        for slot in 0..count {
+            if let Ok((header, offset)) = self.find_metadata_for_slot(image, geometry, slot)
+            {
+                out.push((slot, header, offset));
+            }
+        }
+        out
+    }
+
     /// Load metadata header, validating header SHA-256 and tables SHA-256.
     /// Tries every primary slot first, then every backup slot (AOSP order).
     pub fn find_metadata(
