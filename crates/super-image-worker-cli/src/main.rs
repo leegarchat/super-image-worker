@@ -99,8 +99,19 @@ pub enum Commands {
     /// Create a new empty partition (without payload)
     ///
     /// Creates partition entry with optional initial size. Use --group-size to auto-create group.
-    /// Unlike 'add', this does not write payload data. Enforces group limits unless --force.
     Create(commands::create::CreateArgs),
+
+    /// Delete OTA snapshot COW partitions (lptools --clear-cow analog)
+    ///
+    /// Removes *-cow partitions of the `cow` group with a mapped-device
+    /// safety gate. Raw images and block devices, no root needed.
+    Cow(commands::cow::CowArgs),
+
+    /// Print OTA snapshot update state (snapshotctl dump analog)
+    ///
+    /// Prints `Update state: <state>` from the on-disk snapshot state
+    /// file, for installers to branch on. Read-only, no root needed.
+    SnapshotStatus(commands::snapshot_status::SnapshotStatusArgs),
 
     /// Read partition data to stdout (streaming)
     ///
@@ -152,6 +163,8 @@ fn main() -> std::process::ExitCode {
         Commands::Remove(args) => commands::remove::run(args),
         Commands::Rename(args) => commands::rename::run(args),
         Commands::Create(args) => commands::create::run(args),
+        Commands::Cow(args) => commands::cow::run(args),
+        Commands::SnapshotStatus(args) => commands::snapshot_status::run(args),
         Commands::Read(args) => commands::read::run(args),
         Commands::Connect(args) => commands::connect::run_connect(args),
         Commands::Disconnect(args) => commands::connect::run_disconnect(args),

@@ -1,5 +1,6 @@
 pub mod add;
 pub mod connect;
+pub mod cow;
 pub mod create;
 pub mod extract;
 pub mod info;
@@ -9,4 +10,5 @@ pub mod read;
 pub mod remove;
 pub mod rename;
 pub mod resize;
+pub mod snapshot_status;
 pub(crate) mod split_util;
