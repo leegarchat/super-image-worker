@@ -15,9 +15,12 @@
 * **Послотно-безопасная запись**: обновление метаданных перезаписывает primary- И backup-копии только загруженного слота (`Backup(slot) = 0x3000 + (slot_count + slot) * max_size`); соседние слоты не затрагиваются никогда.
 * **Безопасный от наложений `resize`**: рост расширяет последний экстент на месте, только если хвост доказанно свободен, иначе выделяет новый линейный экстент и вшивает его в окно раздела (последующие разделы сдвигаются) — блоки соседа не затираются.
 * **Split / Retrofit Super**: мультиблочные раскладки (`block_devices`, маршрутизация через `target_source`) на нескольких файлах через повторяемый `--device` (`name=path` либо автоматч по имени файла).
-* **Встроенный аналог `lpmake` (`make`)**: генерация образов с нуля с произвольным целевым слотом (`0|1|a|b|all` — штатный `lpmake` пишет только слот 0), одиночным или retrofit-выводом, raw- или Sparse-контейнерами и мультиблочными spanning-экстентами, когда на одном устройстве места не хватает.
+* **Встроенный аналог `lpmake` (`make`)**: генерация образов с нуля с произвольным целевым слотом (`0|1|a|b|all` — штатный `lpmake` пишет только слот 0), одиночным или retrofit-выводом, raw- или Sparse-контейнерами, мультиблочными spanning-экстентами, когда на одном устройстве места не хватает, пинингом разделов на устройство (`group@device`), переопределением выходов (`--output-map`, файлы или raw-блочные узлы) и сборкой сразу в блочное устройство (размер из `--device` обязан совпасть с probed-размером блока; выводы предварительно зануляются).
+* **Разделение слот/суффикс**: `-s/--slot` (`0|a`, `1|b`, …, `all`) выбирает, какая копия LP-метаданных используется; `--suffix` (`a|b|all`, только длинный флаг) фильтрует буквы имен внутри нее. Слот метаданных с записями и `_a`, и `_b` читается как `--slot 0 --suffix b`.
+* **Raw-блочные устройства везде**: все команды принимают узлы `/dev/block/by-name/*` напрямую (размер определяется через `SEEK_END`, т.к. метаданные блока сообщают 0).
+* **Legacy однослотовые super**: раскладки без суффиксов (`system`, `vendor`, …) с одним слотом метаданных полностью поддерживаются генерацией и всеми командами чтения/записи.
 * **Многопоточное извлечение**: параллельный `extract` на `rayon`, у каждого потока изолированный дескриптор образа (гонок `Seek` нет).
-* **CLI для скриптов**: `--slot` во всех командах, форматы `human`/`json`/`tsv`/`env`, извлечение скаляров через `--get` без завершающего перевода строки, потоковый `read` с `--skip`/`--size` и корректной обработкой `BrokenPipe`.
+* **CLI для скриптов**: `--slot`/`--suffix` во всех командах, форматы `human`/`json`/`tsv`/`env`, извлечение скаляров через `--get` без завершающего перевода строки, потоковый `read` с `--skip`/`--size` и корректной обработкой `BrokenPipe`.
 
 ---
 
@@ -63,6 +66,10 @@ crates/super-image-worker-cli/    Бинарный крейт (clap derive):
 | **Один `make` на устройство** | Раздел больше любого отдельного устройства роняет сборку, хотя суммарно места хватает. | `plan_spanning_allocation` режет payload в цепочку по устройствам (лимит `largest_free_run`). |
 | **Непривязанная запись** | Payload аллоцируется на устройство, чей файл не передан. | `add` аллоцирует только на привязанных (`find_free_sectors_any_in`); быстрый отказ с подсказкой `--device`. |
 | **Переполнение групп** | `maximum_size` игнорируется в `add`/`create`/`make`. | Везде проверяется `used + needed ≤ max`, обход только через `--force`. |
+| **Смешение слот/суффикс** | Один флаг означает и копию метаданных, и буквы имен — строки `_b` в метаслоте 0 недостижимы. | `-s/--slot` выбирает копию метаданных (индекс или алиас `a`/`b`), `--suffix` фильтрует буквы; `--slot 0 --suffix b` их достает. |
+| **Входы-блочные устройства** | `metadata().len()` для блочных узлов равен 0 — все инструменты падают на `/dev/block/...`. | Размер определяется через `SEEK_END`; живые разделы `super` читаются напрямую. |
+| **`map` файловых образов** | Путь файла уходит прямо в `DM_TABLE_LOAD` → `ENODEV`. | Обычные файлы автоматически backing-ятся whole-file loop; блочные узлы проходят каноникализированными. |
+| **Loop-узлы на Android** | Жесткий `/dev/loopN`, которого нет там, где есть только `/dev/block/loopN`. | Пробуются оба префикса; fallback на свободный узел, если `GET_FREE` указал мимо предсозданных. |
 
 ---
 
@@ -107,13 +114,14 @@ cargo test
 
 ## Справочник по интерфейсу CLI
 
-Глобальные соглашения: `--slot <a|b|all>` фильтрует по суффиксу разделов (плюс резолв базовых имен: `-p system -s a` находит `system_a`; беслотовые Virtual A/B разделы подходят всегда). `--device` (повторяемый, в `info`/`extract`/`read`/`add`/`resize`/`create`) привязывает retrofit-вторички как `name=path` либо автоматчится по имени (`vendor.img`, `super_vendor.img`, `*_vendor.img`). Размеры понимают `K`/`M`/`G` (любой регистр), в `resize` еще и `s` (секторы). Коды выхода: `0` успех, `1` ошибка, `2` неверный `--get`-ключ (info).
+Глобальные соглашения: `-s/--slot <0|a|1|b|…|all>` выбирает копию LP-метаданных (по умолчанию `all` — все валидные слоты, как `lpdump -a`); `--suffix <a|b|all>` (только длинный флаг) фильтрует буквы имен внутри нее. Резолв базовых имен: `-p system --suffix a` находит `system_a`; беслотовые Virtual A/B разделы подходят всегда. Все команды принимают raw-образы, Android-sparse и raw-блочные устройства (`/dev/block/by-name/super`). `--device` (повторяемый, в `info`/`extract`/`read`/`add`/`resize`/`create`) привязывает retrofit-вторички как `name=path` либо автоматчится по имени (`vendor.img`, `super_vendor.img`, `*_vendor.img`). Размеры понимают `K`/`M`/`G` (любой регистр), в `resize` еще и `s` (секторы). Коды выхода: `0` успех, `1` ошибка, `2` неверный `--get`-ключ (info). Каждая подкоманда полностью документирована через `super-image-worker <команда> --help`.
 
 ### 1. `info` — инспектор (только чтение, root не нужен)
 
 ```bash
 super-image-worker info super.img                              # Всё, человеческие таблицы
-super-image-worker info super.img -s a -f tsv -H -c name,size_bytes | awk '{print $1}'
+super-image-worker info super.img --suffix a -f tsv -H -c name,size_bytes | awk '{print $1}'
+super-image-worker info /dev/block/by-name/super -s 1          # Метаслот 1 живого раздела
 super-image-worker info super.img -f json | jq '.partitions[] | .name'
 eval $(super-image-worker info super.img -f env); echo $SUPER_PART_SYSTEM_A_SIZE
 super-image-worker info super.img --get partitions.system_a.size
@@ -129,7 +137,7 @@ super-image-worker info sys.img --device vendor=vend.img       # Retrofit-пар
 ```bash
 super-image-worker extract super.img -o ./out                  # Распаковать всё (параллельно на rayon)
 super-image-worker extract super.img -o ./out -p system_a
-super-image-worker extract super.img -o ./out -s a
+super-image-worker extract super.img -o ./out --suffix a
 super-image-worker extract sys.img -o ./out --device vendor=vend.img
 super-image-worker extract super.img --dry-run                 # Только имена + размеры
 super-image-worker extract super.img -o ./out --force          # Перезаписать выходы
@@ -140,7 +148,7 @@ super-image-worker extract super.img -o ./out --force          # Перезап�
 ### 3. `read` — потоковый stdout (только чтение, root не нужен)
 
 ```bash
-super-image-worker read super.img -p system -S a | file -      # (-S = слот; -s = размер)
+super-image-worker read super.img -p system --suffix a | file -   # (-s = размер, --slot/--suffix только длинные)
 super-image-worker read super.img -p vendor_a | sha256sum
 super-image-worker read super.img -p vendor_a --skip 1M --size 10M | xxd | head   # BrokenPipe-safe
 super-image-worker read sys.img -p vendor_a --device vendor=vend.img > vendor.img
@@ -160,9 +168,14 @@ super-image-worker make -o super.img --sparse --slot all --device super:4G \
     --group g:4G --partition system_a:readonly:g:a.img --partition system_b:readonly:g:b.img
 super-image-worker make -o super.img --device super:4G --group g:4G \
     --partition sys:readonly:g:sys.img --dry-run
+super-image-worker make -o /dev/block/by-name/super --device super:9126805504 \
+    --group g:9124708352 --partition system_a:none:g:system_a.img   # Сразу в блочное устройство
+super-image-worker make -o s/super --retrofit --device super:8G --device cust:2G \
+    --output-map super=/dev/block/by-name/super --output-map cust=/dev/block/by-name/cust \
+    --group g:9G --partition vendor_a:none:g@cust:vendor_a.img      # Сплит в блоки, с пином
 ```
 
-Спеки: `--device name:size[:alignment[:alignment_offset]]`, `--group name:max_size`, `--partition name:attrs:group[:payload]` (`readonly,slot_suffixed,updated,disabled,none`; без payload — extent-less заглушка). Слоты `0|1|a|b|all` (по умолчанию `0`); метаданные (геометрия + слоты) живут в файле первого устройства, вторички несут только данные; негабаритные payload режутся по устройствам; `--sparse` дает контейнеры из RAW + DONT_CARE (стейджинг `*.raw-tmp` удаляется); каждая сборка самопроверяется перезагрузкой.
+Спеки: `--device name:size[:alignment[:alignment_offset]]`, `--group name:max_size`, `--partition name:attrs:group[:payload]` (`readonly,slot_suffixed,updated,disabled,none`; без payload — extent-less заглушка), `--partition name:attrs:group@device:payload` пинит раздел на одно split-устройство. Слоты `0|1|a|b|all` (по умолчанию `0`, `a`/`b` — алиасы `0`/`1`); метаданные (геометрия + слоты) живут в файле первого устройства, вторички несут только данные; негабаритные payload режутся по устройствам; `--sparse` дает контейнеры из RAW + DONT_CARE (стейджинг `*.raw-tmp` удаляется); каждая сборка самопроверяется перезагрузкой. Выходы (`-o`, `--output-map name=path`) могут быть обычными файлами или raw-блочными устройствами: для блоков размер спеки обязан точно совпасть с probed-размером блока (проверяется и в `--dry-run`), узел зануляется перед записью, а `--sparse` в блок запрещен.
 
 ### 5. `add` — добавить раздел + payload (только raw, root не нужен)
 
@@ -180,7 +193,7 @@ super-image-worker add sys.img -n extra_a -p extra.img --device vendor=vend.img
 
 ```bash
 super-image-worker resize super.img system_a 2G
-super-image-worker resize super.img system -s a 900M
+super-image-worker resize super.img system --suffix a 900M
 super-image-worker resize super.img vendor_a 512M --allow-shrink
 super-image-worker resize super.img system_a 4G --force
 super-image-worker resize super.img system_a 1G --dry-run
@@ -192,7 +205,7 @@ super-image-worker resize super.img system_a 1G --dry-run
 
 ```bash
 super-image-worker remove super.img my_partition
-super-image-worker remove super.img system -s a
+super-image-worker remove super.img system --suffix a
 super-image-worker remove super.img my_group --group
 super-image-worker remove super.img my_group --group --force   # Каскад: разделы + экстенты
 super-image-worker remove super.img test_a --dry-run
@@ -206,7 +219,7 @@ super-image-worker rename super.img old_group new_group --group
 super-image-worker rename super.img test_a test_b --dry-run
 ```
 
-Только поле имени (≤36 байт, должно оставаться уникальным); checksums обновляются.
+Только поле имени (≤36 байт, должно оставаться уникальным); checksums обновляются. `--slot` выбирает копию метаданных, если имя есть в нескольких слотах.
 
 ### 9. `create` — раздел только в метаданных (только raw, root не нужен)
 
@@ -222,8 +235,8 @@ super-image-worker create super.img -n big_a -g qti_dynamic_partitions_a --size 
 ### 10. `connect` / `disconnect` — loop-устройства (Linux + Android, root)
 
 ```bash
-sudo super-image-worker connect super.img -p odm_a        # Печатает /dev/loopN
-sudo super-image-worker connect super.img -p system -s a
+sudo super-image-worker connect super.img -p odm_a        # Печатает /dev/loopN (на Android /dev/block/loopN)
+sudo super-image-worker connect super.img -p system --suffix a
 sudo mount /dev/loop14 /mnt && sudo umount /mnt
 sudo super-image-worker disconnect super.img -p odm_a
 ```
@@ -234,7 +247,7 @@ sudo super-image-worker disconnect super.img -p odm_a
 
 ```bash
 super-image-worker map super.img -p system_a              # -> /dev/block/mapper/system_a
-super-image-worker map super.img -p vendor -s a --force-writable
+super-image-worker map super.img -p vendor --suffix a --force-writable
 super-image-worker unmap system_a
 ```
 
@@ -275,6 +288,9 @@ export TMPDIR=~/ws/tmp
 * `make --retrofit` 100 + 200 МиБ с payload 60 + 40 МиБ: перелив на устройство 1; сплит-`extract`/`read` совпадают с источниками.
 * Payload 90 МиБ на устройствах 60 + 60 МиБ: автоматический спан из 2 экстентов (59 + 31 МиБ), round-trip цел.
 * Изоляция слотов: после `add` primary+backup слота 0 меняются идентично, хеши слотов 1–2 нетронуты.
+* Двухслотовый образ Pixel (текущий слот `_b`): `--slot 1 --suffix b` открывает живую таблицу; чтения блока побитово совпадают с файловым дампом (sha256).
+* Сплит super по блочным узлам `super`+`cust`+`modem_a`+`modem_b` (`--output-map`, пины `@device`): сборки в файлы, `dd` в блоки и сборки сразу в блоки читаются одинаково под `lpdump` и `siw`.
+* Legacy однослотовый образ (бессуффиксные `system`/`vendor`, один метаслот): round-trip генерация/чтение/extract/resize/rename проверен.
 * `cargo clippy --all-targets -- -D warnings`: чисто. `cargo test`: pass.
 
 ---

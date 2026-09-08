@@ -15,9 +15,12 @@ The utility is completely standalone: for all offline work it requires no superu
 * **Slot-Safe Writes**: Metadata updates rewrite the primary AND backup copies of the loaded slot only (`Backup(slot) = 0x3000 + (slot_count + slot) * max_size`); neighbouring slots are never touched.
 * **Collision-Safe `resize`**: Growth expands the last extent in place when the tail is free, otherwise allocates a new linear extent and splices it into the partition window (later partitions shifted) — never overwrites the neighbour's blocks.
 * **Split / Retrofit Super**: Multi-`block_devices` layouts (`target_source` routing) across several files via repeatable `--device` (`name=path` or auto-match by file name).
-* **Built-in `lpmake` analog (`make`)**: Generates fresh images from scratch with arbitrary target slots (`0|1|a|b|all` — stock `lpmake` only writes slot 0), single or retrofit outputs, raw or Sparse containers, and multi-device spanning extents when one device alone is too small.
+* **Built-in `lpmake` analog (`make`)**: Generates fresh images from scratch with arbitrary target slots (`0|1|a|b|all` — stock `lpmake` only writes slot 0), single or retrofit outputs, raw or Sparse containers, multi-device spanning extents when one device alone is too small, per-partition device pinning (`group@device`), per-device output overrides (`--output-map`, files or raw block nodes), and direct-to-block builds (the `--device` size must equal the probed block size; outputs are zero-filled first).
+* **Slot vs Suffix Separation**: `-s/--slot` (`0|a`, `1|b`, …, `all`) picks which LP metadata copy is used; `--suffix` (`a|b|all`, long flag only) filters partition name letters inside it. A metadata slot holding both `_a` and `_b` entries reads with `--slot 0 --suffix b`.
+* **Raw Block Devices Everywhere**: Every command accepts `/dev/block/by-name/*` nodes directly as inputs (size probed via `SEEK_END`, since block metadata reports 0).
+* **Legacy Single-Slot Supers**: Slotless layouts (`system`, `vendor`, … without suffix letters, one metadata slot) are fully supported for generation and all read/write commands.
 * **Multithreaded Extraction**: Parallel `extract` powered by `rayon`, each thread with an isolated image handle (no `Seek` races).
-* **Script-First CLI**: `--slot` everywhere, `human`/`json`/`tsv`/`env` output formats, `--get` scalar extraction without trailing newlines, streaming `read` with `--skip`/`--size` and graceful `BrokenPipe` handling.
+* **Script-First CLI**: `--slot`/`--suffix` everywhere, `human`/`json`/`tsv`/`env` output formats, `--get` scalar extraction without trailing newlines, streaming `read` with `--skip`/`--size` and graceful `BrokenPipe` handling.
 
 ---
 
@@ -63,6 +66,10 @@ crates/super-image-worker-cli/    Binary crate (clap derive):
 | **Single-device `make`** | Payload larger than any one device fails even when total space suffices. | `plan_spanning_allocation` carves a per-device extent chain (`largest_free_run`-capped). |
 | **Unbound writes** | Payload allocated on a device whose file was never passed. | `add` allocates only on bound devices (`find_free_sectors_any_in`); fast failure with `--device` hint. |
 | **Group overcommit** | `maximum_size` ignored on `add`/`create`/`make`. | `used + needed ≤ max` enforced everywhere unless `--force`. |
+| **Slot/suffix conflation** | One flag means both the metadata copy and the name letters, so `_b` rows living in metadata slot 0 are unreachable. | `-s/--slot` selects the metadata copy (index or `a`/`b` alias), `--suffix` filters the letters; `--slot 0 --suffix b` reaches them. |
+| **Block-device inputs** | `metadata().len()` is 0 for block nodes, so every tool fails on `/dev/block/...`. | Size probed via `SEEK_END`; live `super` partitions read directly. |
+| **`map` on file images** | File path passed straight to `DM_TABLE_LOAD` → `ENODEV`. | Regular files are auto-backed by a whole-file loop; block nodes pass through canonicalized. |
+| **Loop nodes on Android** | Hardcoded `/dev/loopN` missing on devices exposing `/dev/block/loopN`. | Both prefixes tried; free-node fallback when `GET_FREE` points past pre-created nodes. |
 
 ---
 
@@ -107,13 +114,14 @@ cargo test
 
 ## CLI Reference
 
-Global conventions: `--slot <a|b|all>` filters by partition suffix (plus base-name resolution: `-p system -s a` matches `system_a`; slotless Virtual A/B partitions always match). `--device` (repeatable, `info`/`extract`/`read`/`add`/`resize`/`create`) binds retrofit secondaries as `name=path` or auto-matched bare paths (`vendor.img`, `super_vendor.img`, `*_vendor.img`). Sizes accept `K`/`M`/`G` (any case) and `s` sectors in `resize`. Exit codes: `0` success, `1` failure, `2` bad `--get` key (info).
+Global conventions: `-s/--slot <0|a|1|b|…|all>` picks the LP metadata copy (default `all`, like `lpdump -a`); `--suffix <a|b|all>` (long flag only) filters partition name letters inside it. Base-name resolution: `-p system --suffix a` matches `system_a`; slotless Virtual A/B partitions always match. Every command accepts raw images, Android-sparse images, and raw block devices (`/dev/block/by-name/super`) as inputs. `--device` (repeatable, `info`/`extract`/`read`/`add`/`resize`/`create`) binds retrofit secondaries as `name=path` or auto-matched bare paths (`vendor.img`, `super_vendor.img`, `*_vendor.img`). Sizes accept `K`/`M`/`G` (any case) and `s` sectors in `resize`. Exit codes: `0` success, `1` failure, `2` bad `--get` key (info). Every subcommand documents itself in full via `super-image-worker <command> --help`.
 
 ### 1. `info` — Inspector (read-only, no root)
 
 ```bash
 super-image-worker info super.img                              # Everything, human tables
-super-image-worker info super.img -s a -f tsv -H -c name,size_bytes | awk '{print $1}'
+super-image-worker info super.img --suffix a -f tsv -H -c name,size_bytes | awk '{print $1}'
+super-image-worker info /dev/block/by-name/super -s 1          # Metadata slot 1 of the live partition
 super-image-worker info super.img -f json | jq '.partitions[] | .name'
 eval $(super-image-worker info super.img -f env); echo $SUPER_PART_SYSTEM_A_SIZE
 super-image-worker info super.img --get partitions.system_a.size
@@ -129,7 +137,7 @@ Formats: `human` (default), `json` (pretty, jq-safe), `tsv` (`-H` drops header, 
 ```bash
 super-image-worker extract super.img -o ./out                  # Unpack everything (rayon-parallel)
 super-image-worker extract super.img -o ./out -p system_a
-super-image-worker extract super.img -o ./out -s a
+super-image-worker extract super.img -o ./out --suffix a
 super-image-worker extract sys.img -o ./out --device vendor=vend.img
 super-image-worker extract super.img --dry-run                 # Names + sizes only
 super-image-worker extract super.img -o ./out --force          # Overwrite outputs
@@ -140,7 +148,7 @@ Creates `<partition_name>.img` per partition (empty files for extent-less ones),
 ### 3. `read` — Streaming stdout (read-only, no root)
 
 ```bash
-super-image-worker read super.img -p system -S a | file -      # (-S = slot; -s = size)
+super-image-worker read super.img -p system --suffix a | file -   # (-s = size, --slot/--suffix long-only here)
 super-image-worker read super.img -p vendor_a | sha256sum
 super-image-worker read super.img -p vendor_a --skip 1M --size 10M | xxd | head   # BrokenPipe-safe
 super-image-worker read sys.img -p vendor_a --device vendor=vend.img > vendor.img
@@ -160,9 +168,14 @@ super-image-worker make -o super.img --sparse --slot all --device super:4G \
     --group g:4G --partition system_a:readonly:g:a.img --partition system_b:readonly:g:b.img
 super-image-worker make -o super.img --device super:4G --group g:4G \
     --partition sys:readonly:g:sys.img --dry-run
+super-image-worker make -o /dev/block/by-name/super --device super:9126805504 \
+    --group g:9124708352 --partition system_a:none:g:system_a.img   # Straight into the block node
+super-image-worker make -o s/super --retrofit --device super:8G --device cust:2G \
+    --output-map super=/dev/block/by-name/super --output-map cust=/dev/block/by-name/cust \
+    --group g:9G --partition vendor_a:none:g@cust:vendor_a.img      # Split into blocks, pinned
 ```
 
-Specs: `--device name:size[:alignment[:alignment_offset]]`, `--group name:max_size`, `--partition name:attrs:group[:payload]` (`readonly,slot_suffixed,updated,disabled,none`; no payload = extent-less placeholder). Slots `0|1|a|b|all` (default `0`); metadata (geometry + slots) lives in the first device file, secondaries carry data only; oversized payloads span devices; `--sparse` emits RAW + DONT_CARE containers (staging `*.raw-tmp` removed); every build self-verifies via reload.
+Specs: `--device name:size[:alignment[:alignment_offset]]`, `--group name:max_size`, `--partition name:attrs:group[:payload]` (`readonly,slot_suffixed,updated,disabled,none`; no payload = extent-less placeholder), `--partition name:attrs:group@device:payload` pins one partition to a single split device. Slots `0|1|a|b|all` (default `0`, `a`/`b` alias `0`/`1`); metadata (geometry + slots) lives in the first device file, secondaries carry data only; oversized payloads span devices; `--sparse` emits RAW + DONT_CARE containers (staging `*.raw-tmp` removed); every build self-verifies via reload. Outputs (`-o`, `--output-map name=path`) may be regular files or raw block devices: for blocks the spec size must equal the probed block size exactly (checked in `--dry-run` too), the node is zero-filled before writing, and `--sparse` to a block is refused.
 
 ### 5. `add` — Append partition + payload (raw only, no root)
 
@@ -180,7 +193,7 @@ Group auto-selection (`qti_* > google_* > samsung_*/sec_* > mtk_* > largest`) wi
 
 ```bash
 super-image-worker resize super.img system_a 2G
-super-image-worker resize super.img system -s a 900M
+super-image-worker resize super.img system --suffix a 900M
 super-image-worker resize super.img vendor_a 512M --allow-shrink
 super-image-worker resize super.img system_a 4G --force
 super-image-worker resize super.img system_a 1G --dry-run
@@ -192,7 +205,7 @@ Growth expands in place or splices a new extent; shrink truncates/drops trailing
 
 ```bash
 super-image-worker remove super.img my_partition
-super-image-worker remove super.img system -s a
+super-image-worker remove super.img system --suffix a
 super-image-worker remove super.img my_group --group
 super-image-worker remove super.img my_group --group --force   # Cascade: partitions + extents
 super-image-worker remove super.img test_a --dry-run
@@ -206,7 +219,7 @@ super-image-worker rename super.img old_group new_group --group
 super-image-worker rename super.img test_a test_b --dry-run
 ```
 
-Name field only (≤36 bytes, must stay unique); checksums refreshed.
+Name field only (≤36 bytes, must stay unique); checksums refreshed. `--slot` picks the metadata copy when the name exists in several slots.
 
 ### 9. `create` — Metadata-only partition (raw only, no root)
 
@@ -222,8 +235,8 @@ Like `add` without payload bytes; `--size 0` reserves an extent-less placeholder
 ### 10. `connect` / `disconnect` — Loop devices (Linux + Android, root)
 
 ```bash
-sudo super-image-worker connect super.img -p odm_a        # Prints /dev/loopN
-sudo super-image-worker connect super.img -p system -s a
+sudo super-image-worker connect super.img -p odm_a        # Prints /dev/loopN (or /dev/block/loopN on Android)
+sudo super-image-worker connect super.img -p system --suffix a
 sudo mount /dev/loop14 /mnt && sudo umount /mnt
 sudo super-image-worker disconnect super.img -p odm_a
 ```
@@ -234,7 +247,7 @@ Single-linear-extent partitions only (fragmented ones are refused with a `map` h
 
 ```bash
 super-image-worker map super.img -p system_a              # -> /dev/block/mapper/system_a
-super-image-worker map super.img -p vendor -s a --force-writable
+super-image-worker map super.img -p vendor --suffix a --force-writable
 super-image-worker unmap system_a
 ```
 
@@ -275,6 +288,9 @@ Measured on a 9.0 GiB real-device `super` image (14 partitions, 7 with data):
 * `make --retrofit` 100 + 200 MiB with 60 + 40 MiB payloads: spillover onto device 1; split `extract`/`read` match sources.
 * 90 MiB payload over 60 + 60 MiB devices: automatic 2-extent span (59 + 31 MiB), round-trip intact.
 * Slot isolation: after `add`, primary+backup of slot 0 change identically while slots 1–2 hashes are untouched.
+* Dual-slot Pixel image (current slot `_b`): `--slot 1 --suffix b` exposes the live table; block reads match the file dump bit-identically (sha256).
+* Split super across `super`+`cust`+`modem_a`+`modem_b` block nodes (`--output-map`, `@device` pins): file builds, `dd` imaging, and direct-to-block builds all read back identically under `lpdump` and `siw`.
+* Legacy single-slot image (slotless `system`/`vendor`, one metadata slot): generate/read/extract/resize/rename round-trip verified.
 * `cargo clippy --all-targets -- -D warnings`: clean. `cargo test`: pass.
 
 ---
