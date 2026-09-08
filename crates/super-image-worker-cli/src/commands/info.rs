@@ -1,6 +1,6 @@
 use crate::output::{table, table::TsvOptions};
 use clap;
-use super_image_worker_core::load_super;
+use super_image_worker_core::{load_super_all, load_super_in_slot, suffix_to_slot};
 use std::path::PathBuf;
 
 #[derive(clap::Args)]
@@ -120,14 +120,6 @@ pub fn run(args: InfoArgs) -> std::process::ExitCode {
         return std::process::ExitCode::SUCCESS;
     }
 
-    let data = match load_super(&args.image) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-
     let slot = match args.slot.as_str() {
         "a" | "A" => Some("a"),
         "b" | "B" => Some("b"),
@@ -138,8 +130,52 @@ pub fn run(args: InfoArgs) -> std::process::ExitCode {
         }
     };
 
+    // Slot-aware loading: `--slot a|b` opens that metadata slot
+    // (0 <-> _a, 1 <-> _b); `--slot all` opens every valid slot
+    // (mirrors `lpdump -a`). This fixes dual-slot images (e.g. shiba
+    // current slot _b) where the old first-valid-slot loader only
+    // exposed slot 0 partitions, so `-s b` showed zero rows.
+    let datas = if let Some(sfx) = slot {
+        match suffix_to_slot(sfx).map(|idx| load_super_in_slot(&args.image, idx)) {
+            Some(Ok(d)) => vec![d],
+            Some(Err(e)) => {
+                eprintln!("error: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+            None => {
+                eprintln!("unknown slot: {sfx}");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+    } else {
+        match load_super_all(&args.image) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+    };
+
+    if datas.is_empty() {
+        eprintln!("error: no valid LP metadata slots found");
+        return std::process::ExitCode::FAILURE;
+    }
+
     if let Some(ref key) = args.get {
-        table::print_get(&data, key);
+        // Search the requested slot, or every slot when `--slot all`.
+        // First match wins so `partitions.system_b.size` resolves even
+        // when several metadata slots are present.
+        for data in &datas {
+            // Probe without exiting: clone the lookup by checking names.
+            // print_get exits(2) on miss, so pre-check here.
+            if key_is_present(data, key) {
+                table::print_get(data, key);
+                return std::process::ExitCode::SUCCESS;
+            }
+        }
+        // Fall through to let print_get emit the precise error/exit code.
+        table::print_get(&datas[0], key);
         return std::process::ExitCode::SUCCESS;
     }
 
@@ -152,27 +188,46 @@ pub fn run(args: InfoArgs) -> std::process::ExitCode {
             && !args.mapping);
 
     // Split/retrofit binding report (validates --device specs).
-    let bindings = super::split_util::binding_report(&data, &args.device, &args.image);
-    if !bindings.is_empty() {
-        println!("=== Device Bindings (split/retrofit) ===");
-        for line in &bindings {
-            println!("{line}");
+    // Report against the first slot; bindings are layout-wide.
+    {
+        let bindings = super::split_util::binding_report(&datas[0], &args.device, &args.image);
+        if !bindings.is_empty() {
+            println!("=== Device Bindings (split/retrofit) ===");
+            for line in &bindings {
+                println!("{line}");
+            }
+            println!();
         }
-        println!();
     }
 
+    // Suffix filter applies inside each loaded metadata slot. It is
+    // redundant for slot-per-suffix images (shiba slot 1 holds only
+    // `_b`) but required for mixed slots (marble slot 0 holds `_a`
+    // with data plus empty `_b` placeholders).
+    let inner_filter: Option<&str> = slot;
+
     match args.format.as_str() {
-        "human" => table::print_human(
-            &data,
-            slot,
-            show_all || args.info,
-            show_all || args.groups,
-            show_all || args.devices,
-            show_all || args.partitions,
-            show_all || args.extents,
-            show_all || args.mapping,
-        ),
-        "json" => table::print_json(&data, slot),
+        "human" => {
+            for data in &datas {
+                if datas.len() > 1 {
+                    println!(
+                        "### Metadata slot {} (offset 0x{:x}) ###",
+                        data.metadata_slot, data.metadata_offset
+                    );
+                }
+                table::print_human(
+                    data,
+                    inner_filter,
+                    show_all || args.info,
+                    show_all || args.groups,
+                    show_all || args.devices,
+                    show_all || args.partitions,
+                    show_all || args.extents,
+                    show_all || args.mapping,
+                );
+            }
+        }
+        "json" => table::print_json_slots(&datas, slot),
         "tsv" => {
             let columns = args
                 .columns
@@ -191,9 +246,26 @@ pub fn run(args: InfoArgs) -> std::process::ExitCode {
                 columns,
                 bytes: args.bytes,
             };
-            table::print_tsv(&data, slot, &opts);
+            let mut first = true;
+            for data in &datas {
+                let mut opts_ref = TsvOptions {
+                    header: opts.header && first,
+                    columns: opts.columns.clone(),
+                    bytes: opts.bytes,
+                };
+                let _ = &mut opts_ref;
+                table::print_tsv(data, inner_filter, &opts_ref);
+                first = false;
+            }
         }
-        "env" => table::print_env(&data, slot),
+        "env" => {
+            for data in &datas {
+                if datas.len() > 1 {
+                    println!("# metadata_slot={} offset=0x{:x}", data.metadata_slot, data.metadata_offset);
+                }
+                table::print_env(data, inner_filter);
+            }
+        }
         other => {
             eprintln!("unknown format: {other}");
             return std::process::ExitCode::FAILURE;
@@ -201,6 +273,28 @@ pub fn run(args: InfoArgs) -> std::process::ExitCode {
     }
 
     std::process::ExitCode::SUCCESS
+}
+
+/// Non-exiting presence check mirroring `print_get` keys, so `--get`
+/// across several slots can pick the slot that actually holds the key
+/// instead of exiting 2 on the first slot.
+fn key_is_present(data: &super_image_worker_core::SuperData, key: &str) -> bool {
+    let parts: Vec<&str> = key.split('.').collect();
+    match parts.as_slice() {
+        ["format" | "size" | "size_human" | "geometry_offset" | "metadata_offset"
+        | "metadata_slot" | "metadata_max_size" | "metadata_slot_count"
+        | "logical_block_size" | "metadata_version" | "header_size" | "tables_size"
+        | "available_suffixes" | "partition_count" | "groups" | "devices"] => true,
+        ["partitions" | "partition", name, _] => {
+            data.partitions.iter().any(|p| p.name == *name)
+        }
+        ["partitions" | "partition", name, "extent", _, _] => {
+            data.partitions.iter().any(|p| p.name == *name)
+        }
+        ["group", name, _] => data.groups.iter().any(|g| g.name == *name),
+        ["device", name, _] => data.devices.iter().any(|d| d.partition_name == *name),
+        _ => false,
+    }
 }
 
 fn print_keys() {
