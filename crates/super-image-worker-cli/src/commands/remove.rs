@@ -1,5 +1,5 @@
+use super::split_util;
 use clap::Args;
-use super_image_worker_core::load_super;
 use std::fs::File;
 use std::path::PathBuf;
 
@@ -53,7 +53,13 @@ pub struct RemoveArgs {
 }
 
 pub fn run(args: RemoveArgs) -> std::process::ExitCode {
-    let mut data = match load_super(&args.image) {
+    let slot_opt: Option<&str> = match args.slot.as_str() {
+        "a" | "A" => Some("a"),
+        "b" | "B" => Some("b"),
+        "all" => None,
+        _ => None,
+    };
+    let mut data = match split_util::load_for_write(&args.image, &args.name, slot_opt) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("error: {e}");
