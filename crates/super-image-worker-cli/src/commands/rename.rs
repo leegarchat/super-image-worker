@@ -1,5 +1,6 @@
+use super::split_util;
 use clap::Args;
-use super_image_worker_core::{LpWriter, load_super};
+use super_image_worker_core::LpWriter;
 use std::fs::File;
 use std::path::PathBuf;
 
@@ -31,13 +32,28 @@ pub struct RenameArgs {
     #[arg(long)]
     pub group: bool,
 
+    /// Target metadata slot for suffix-less names (a, b; default: auto
+    /// by `_a`/`_b` suffix of the current name). Needed to address a
+    /// specific slot on multi-slot images.
+    #[arg(short, long, default_value = "all")]
+    pub slot: String,
+
     /// Dry run - show what would change without modifying image
     #[arg(long)]
     pub dry_run: bool,
 }
 
 pub fn run(args: RenameArgs) -> std::process::ExitCode {
-    let mut data = match load_super(&args.image) {
+    let slot_opt: Option<&str> = match args.slot.as_str() {
+        "a" | "A" => Some("a"),
+        "b" | "B" => Some("b"),
+        "all" => None,
+        other => {
+            eprintln!("unknown slot: {other} (use a, b, all)");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let mut data = match split_util::load_for_write(&args.image, &args.old_name, slot_opt) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("error: {e}");
