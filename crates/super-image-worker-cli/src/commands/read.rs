@@ -14,7 +14,8 @@ files. Ideal for pipelines into file, md5sum/sha256sum, dd, xxd, simg2img.\n\
 A closed pipe (`| head -c`) exits 0 via graceful BrokenPipe handling.\n\
 Accepts raw and Android-sparse images; read-only, no root needed.\n\n\
 PARTITION SELECTION: -p takes a full name (system_a) or a base name plus\n\
---slot/-S (system -S a). Slotless partitions match any slot.\n\n\
+--suffix (system --suffix a). --slot <index|all> picks the metadata copy.\nNote: -s is --size here, so --suffix/--slot are long-only.\n\
+Slotless partitions match any suffix.\n\n\
 RANGE (--skip/--size, plain bytes or K/M/G suffix, e.g. 10M, 512K, 2G):\n\
   default streams the whole partition; --skip drops a prefix, --size caps\n\
   the length. Values beyond end-of-partition are clamped, not errors.\n\n\
@@ -22,7 +23,7 @@ SPLIT / RETROFIT: repeatable --device (vendor=path or auto-matched path).\n\
 Missing bindings fail with the exact device name to pass.\n\n\
 EXAMPLES:\n\
   super-image-worker read super.img -p odm_a > odm.img\n\
-  super-image-worker read super.img -p system -S a | file -\n\
+  super-image-worker read super.img -p system --suffix a | file -\n\
   super-image-worker read super.img -p vendor_a | sha256sum\n\
   super-image-worker read super.img -p vendor_a --skip 1M --size 10M | xxd | head\n\
   super-image-worker read super.img -p system_a --size 100M | simg2img - out.raw\n\
@@ -32,13 +33,20 @@ pub struct ReadArgs {
     /// Path to super image (raw or sparse format)
     pub image: PathBuf,
 
-    /// Partition name to read (base name allowed with --slot)
+    /// Partition name to read (base name allowed with --suffix)
     #[arg(short, long)]
     pub partition: String,
 
-    /// Filter by slot suffix: a, b, or all
-    #[arg(short = 'S', long, default_value = "all")]
+    /// Metadata slot to read: 0|a, 1|b, ... or all (default: all).
+    /// Selects which LP metadata copy is used, independent of names.
+    /// (Long flag only: -s is taken by --size.)
+    #[arg(long, default_value = "all")]
     pub slot: String,
+
+    /// Extra name filter (long flag only): a, b, or all (default: all).
+    /// Slotless partitions always match.
+    #[arg(long, default_value = "all")]
+    pub suffix: String,
 
     /// Bind secondary block devices for split/retrofit images.
     /// Repeatable: `--device vendor=path` or `--device path` (auto-match).
@@ -90,18 +98,22 @@ impl<'a> ActiveReader<'a> {
 }
 
 pub fn run(args: ReadArgs) -> std::process::ExitCode {
-    let slot = match args.slot.as_str() {
-        "a" | "A" => Some("a"),
-        "b" | "B" => Some("b"),
-        "all" => None,
-        other => {
-            eprintln!("unknown slot: {other} (use a, b, all)");
+    // --slot picks the metadata copy (index), --suffix the name letters.
+    let slot = match split_util::parse_slot_opt(&args.slot) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let suffix = match split_util::parse_suffix_opt(&args.suffix) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
 
-    // Slot-aware: `-S b` reads metadata slot 1, `-S all` searches all
-    // valid slots so `system_b` resolves on dual-slot images.
     let datas = match split_util::load_for_slot_filter(&args.image, slot) {
         Ok(v) => v,
         Err(e) => {
@@ -110,7 +122,7 @@ pub fn run(args: ReadArgs) -> std::process::ExitCode {
         }
     };
     let (slot_pos, part_idx) =
-        match split_util::find_partition_across(&datas, &args.partition, slot) {
+        match split_util::find_partition_across(&datas, &args.partition, suffix) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("error: {e}");

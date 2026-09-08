@@ -32,11 +32,15 @@ pub struct RenameArgs {
     #[arg(long)]
     pub group: bool,
 
-    /// Target metadata slot for suffix-less names (a, b; default: auto
-    /// by `_a`/`_b` suffix of the current name). Needed to address a
-    /// specific slot on multi-slot images.
-    #[arg(short, long, default_value = "all")]
+    /// Metadata slot (-s) to edit: 0|a, 1|b, ... or all (default: all).
+    /// With `all` the current name must resolve in exactly one slot.
+    #[arg(short = 's', long, default_value = "all")]
     pub slot: String,
+
+    /// Extra name filter (long flag only): a, b, or all (default: all).
+    /// Only affects base-name resolution; exact names match directly.
+    #[arg(long, default_value = "all")]
+    pub suffix: String,
 
     /// Dry run - show what would change without modifying image
     #[arg(long)]
@@ -44,19 +48,51 @@ pub struct RenameArgs {
 }
 
 pub fn run(args: RenameArgs) -> std::process::ExitCode {
-    let slot_opt: Option<&str> = match args.slot.as_str() {
-        "a" | "A" => Some("a"),
-        "b" | "B" => Some("b"),
-        "all" => None,
-        other => {
-            eprintln!("unknown slot: {other} (use a, b, all)");
+    // --slot picks the metadata copy (index), --suffix the name letters.
+    let slot_idx = match split_util::parse_slot_opt(&args.slot) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
-    let mut data = match split_util::load_for_write(&args.image, &args.old_name, slot_opt) {
-        Ok(d) => d,
+    let suffix = match split_util::parse_suffix_opt(&args.suffix) {
+        Ok(s) => s,
         Err(e) => {
             eprintln!("error: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let datas = match split_util::load_for_slot_filter(&args.image, slot_idx) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    // Groups resolve by exact name; partitions through the resolver
+    // (exactly one owning slot required).
+    let slot_pos = if args.group {
+        match super::remove::select_group_slot(&datas, &args.old_name, slot_idx) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+    } else {
+        match split_util::resolve_write_slot(&datas, &args.old_name, suffix, slot_idx) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+    };
+    let mut data = match datas.get(slot_pos).cloned() {
+        Some(d) => d,
+        None => {
+            eprintln!("error: metadata slot not found");
             return std::process::ExitCode::FAILURE;
         }
     };

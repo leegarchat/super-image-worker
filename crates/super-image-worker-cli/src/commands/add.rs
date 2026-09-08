@@ -41,6 +41,11 @@ pub struct AddArgs {
     #[arg(short, long)]
     pub name: String,
 
+    /// Metadata slot (-s) whose table grows: 0|a, 1|b, ... or all
+    /// (default: all). With `all` exactly one valid slot must exist.
+    #[arg(short = 's', long, default_value = "all")]
+    pub slot: String,
+
     /// Path to payload file (any format: img, bin, txt, etc.)
     /// File is streamed in chunks, never fully loaded into RAM
     #[arg(short, long)]
@@ -67,10 +72,32 @@ pub struct AddArgs {
 }
 
 pub fn run(args: AddArgs) -> std::process::ExitCode {
-    let mut data = match split_util::load_for_write(&args.image, &args.name, None) {
-        Ok(d) => d,
+    // --slot picks the metadata table that grows (no suffix guessing).
+    let slot_idx = match split_util::parse_slot_opt(&args.slot) {
+        Ok(s) => s,
         Err(e) => {
             eprintln!("error: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let datas = match split_util::load_for_slot_filter(&args.image, slot_idx) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let slot_pos = match split_util::resolve_new_slot(&datas, slot_idx) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let mut data = match datas.get(slot_pos).cloned() {
+        Some(d) => d,
+        None => {
+            eprintln!("error: metadata slot not found");
             return std::process::ExitCode::FAILURE;
         }
     };

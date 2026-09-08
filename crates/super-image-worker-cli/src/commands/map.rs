@@ -238,10 +238,11 @@ Creates /dev/block/mapper/<partition_name> device that can be used for:\n\
 Requires root privileges. The readonly flag follows the partition attributes\n\
 unless --force-writable is passed. Prints the mapper path on success.\n\
 On a Linux host use 'connect'/'disconnect' (loop devices) instead.\n\n\
-NAME RESOLUTION: full name (-p system_a) or base name plus --slot.\n\n\
+NAME RESOLUTION: full name (-p system_a) or base name plus --suffix\n\
+(-p system --suffix b); -s/--slot <0|a|1|b|...|all> picks the metadata copy.\n\n\
 EXAMPLES:\n\
   super-image-worker map super.img -p system_a\n\
-  super-image-worker map super.img -p vendor -s a\n\
+  super-image-worker map super.img -p vendor --suffix a\n\
   super-image-worker map super.img -p system_a --force-writable"
 )]
 pub struct MapArgs {
@@ -252,9 +253,15 @@ pub struct MapArgs {
     #[arg(short, long)]
     pub partition: String,
 
-    /// Filter by slot suffix: a, b, or all
-    #[arg(short, long, default_value = "all")]
+    /// Metadata slot (-s): 0|a, 1|b, ... or all (default: all).
+    /// Selects which LP metadata copy is used, independent of names.
+    #[arg(short = 's', long, default_value = "all")]
     pub slot: String,
+
+    /// Extra name filter (long flag only): keeps partitions with that
+    /// name suffix (a, b, or all, default: all). Slotless partitions always match.
+    #[arg(long, default_value = "all")]
+    pub suffix: String,
 
     /// Force writable - ignore partition readonly attribute
     /// Useful for recovery/development scenarios
@@ -276,15 +283,6 @@ EXAMPLES:\n\
 pub struct UnmapArgs {
     /// Partition name to unmap (as shown by 'map' command)
     pub partition: String,
-}
-
-fn parse_slot_filter(slot: &str) -> Result<Option<&str>, String> {
-    match slot {
-        "a" | "A" => Ok(Some("a")),
-        "b" | "B" => Ok(Some("b")),
-        "all" => Ok(None),
-        other => Err(format!("unknown slot: {other} (use a, b, all)")),
-    }
 }
 
 /// Loop node resolution shared with `connect`: Android keeps loops at
@@ -454,16 +452,22 @@ pub fn run_map(args: MapArgs) -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
-    let slot_filter = match parse_slot_filter(&args.slot) {
+    // --slot picks the metadata copy (index), --suffix the name letters.
+    let slot = match split_util::parse_slot_opt(&args.slot) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
-    // Slot-aware: `-s b` maps from metadata slot 1, `all` searches all
-    // valid slots so `system_b` resolves on dual-slot images.
-    let datas = match split_util::load_for_slot_filter(&args.image, slot_filter) {
+    let suffix = match split_util::parse_suffix_opt(&args.suffix) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let datas = match split_util::load_for_slot_filter(&args.image, slot) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("error: {e}");
@@ -471,7 +475,7 @@ pub fn run_map(args: MapArgs) -> std::process::ExitCode {
         }
     };
     let (slot_pos, part_idx) =
-        match split_util::find_partition_across(&datas, &args.partition, slot_filter) {
+        match split_util::find_partition_across(&datas, &args.partition, suffix) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("error: {e}");

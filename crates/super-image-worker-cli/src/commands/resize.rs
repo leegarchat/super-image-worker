@@ -16,7 +16,8 @@ overwriting the neighbour's blocks. Extent-less partitions (empty slot B)\n\
 get a fresh extent. SHRINK (--allow-shrink): trailing extents are truncated\n\
 or dropped so the total equals the target; shrinking to 0 removes all extents.\n\
 Data itself is never moved. Raw images only. No root needed.\n\n\
-NAME RESOLUTION: full name (system_a) or base name plus --slot (system -s a).\n\n\
+NAME RESOLUTION: full name (system_a) or base name plus --suffix\n\
+(system --suffix a); -s/--slot picks the metadata copy to edit.\n\n\
 SIZE FORMAT: plain bytes (1048576), K/M/G suffixes upper or lower (512M, 2g),\n\
 or sectors with trailing s (2048s). New size is rounded UP to whole sectors.\n\n\
 GROUP LIMITS: the group's maximum_size is enforced (siblings + new size <= max)\n\
@@ -26,7 +27,7 @@ SPLIT / RETROFIT: repeatable --device; growth may land on any bound device.\n\
 Metadata is rewritten (primary + backup of the loaded slot) in the main file.\n\n\
 EXAMPLES:\n\
   super-image-worker resize super.img system_a 2G\n\
-  super-image-worker resize super.img system -s a 900M        # Base name + slot\n\
+  super-image-worker resize super.img system --suffix a 900M  # Base name + suffix\n\
   super-image-worker resize super.img vendor_a 512M --allow-shrink\n\
   super-image-worker resize super.img system_a 4G --force     # Over group max_size\n\
   super-image-worker resize super.img system_a 1G --dry-run"
@@ -35,15 +36,21 @@ pub struct ResizeArgs {
     /// Path to super image (raw format only)
     pub image: PathBuf,
 
-    /// Partition name to resize (base name allowed with --slot)
+    /// Partition name to resize (base name allowed with --suffix)
     pub name: String,
 
     /// New size in bytes, or with suffix: K, M, G, s (sectors)
     pub size: String,
 
-    /// Filter by slot suffix: a, b, or all (for base-name resolution)
-    #[arg(short, long, default_value = "all")]
+    /// Metadata slot (-s) to edit: 0|a, 1|b, ... or all (default: all).
+    /// With `all` the entry must resolve in exactly one slot.
+    #[arg(short = 's', long, default_value = "all")]
     pub slot: String,
+
+    /// Filter by partition name suffix for base-name resolution:
+    /// a, b, or all (default: all)
+    #[arg(long, default_value = "all")]
+    pub suffix: String,
 
     /// Bind secondary block devices for split/retrofit images.
     /// Repeatable: `--device vendor=path` or `--device path` (auto-match).
@@ -86,21 +93,39 @@ fn parse_size(s: &str) -> Result<u64, String> {
 
 #[allow(clippy::collapsible_if)]
 pub fn run(args: ResizeArgs) -> std::process::ExitCode {
-    let slot_opt = match args.slot.as_str() {
-        "a" | "A" => Some("a"),
-        "b" | "B" => Some("b"),
-        "all" => None,
-        other => {
-            eprintln!("unknown slot: {other} (use a, b, all)");
+    // --slot picks the metadata copy (index), --suffix the name letters.
+    let slot_idx = match split_util::parse_slot_opt(&args.slot) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
-    // Slot-aware: `system_b` (or `-s b`) edits metadata slot 1,
-    // so dual-slot images no longer hit "not found" via slot 0.
-    let mut data = match split_util::load_for_write(&args.image, &args.name, slot_opt) {
-        Ok(d) => d,
+    let suffix = match split_util::parse_suffix_opt(&args.suffix) {
+        Ok(s) => s,
         Err(e) => {
             eprintln!("error: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let datas = match split_util::load_for_slot_filter(&args.image, slot_idx) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let slot_pos = match split_util::resolve_write_slot(&datas, &args.name, suffix, slot_idx) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let mut data = match datas.get(slot_pos).cloned() {
+        Some(d) => d,
+        None => {
+            eprintln!("error: metadata slot not found");
             return std::process::ExitCode::FAILURE;
         }
     };
@@ -118,9 +143,7 @@ pub fn run(args: ResizeArgs) -> std::process::ExitCode {
         }
     };
 
-    let slot = slot_opt;
-
-    let part_idx = match data.resolve_partition(&args.name, slot) {
+    let part_idx = match data.resolve_partition(&args.name, suffix) {
         Ok(i) => i,
         Err(e) => {
             eprintln!("error: {e}");

@@ -9,7 +9,8 @@ use std::path::PathBuf;
     long_about = "Remove a partition or group from super image LP metadata.\n\n\
 PARTITION MODE (default): drops the partition entry and cuts out its extents\n\
 from the extent table; first_extent_index of later partitions is shifted down.\n\
-Name accepts a full name (system_a) or a base name plus --slot (system -s a).\n\
+Name accepts a full name (system_a) or a base name plus --suffix\n\
+(system --suffix a); -s/--slot picks the metadata copy to edit.\n\
 Payload bytes stay in place (they become free space for future allocations).\n\n\
 GROUP MODE (--group): drops the group entry and renumbers group_index of\n\
 survivors. Refuses non-empty groups unless --force cascades: with --force,\n\
@@ -18,7 +19,7 @@ dependency-safe descending order), then the group itself. --dry-run previews.\n\
 Raw images only. No root needed.\n\n\
 EXAMPLES:\n\
   super-image-worker remove super.img my_partition\n\
-  super-image-worker remove super.img system -s a\n\
+  super-image-worker remove super.img system --suffix a\n\
   super-image-worker remove super.img my_group --group\n\
   super-image-worker remove super.img my_group --group --force   # Cascade + extents\n\
   super-image-worker remove super.img test_a --dry-run"
@@ -27,12 +28,18 @@ pub struct RemoveArgs {
     /// Path to super image (raw format only)
     pub image: PathBuf,
 
-    /// Partition or group name to remove (base name allowed with --slot)
+    /// Partition or group name to remove (base name allowed with --suffix)
     pub name: String,
 
-    /// Filter by slot suffix: a, b, or all (partition mode only)
-    #[arg(short, long, default_value = "all")]
+    /// Metadata slot (-s) to edit: 0|a, 1|b, ... or all (default: all).
+    /// With `all` the entry must resolve in exactly one slot.
+    #[arg(short = 's', long, default_value = "all")]
     pub slot: String,
+
+    /// Extra name filter for base-name resolution (long flag only):
+    /// a, b, or all (default: all, partition mode only)
+    #[arg(long, default_value = "all")]
+    pub suffix: String,
 
     /// Remove a group instead of partition
     /// Group must be empty (no partitions assigned), unless --force is given
@@ -52,17 +59,90 @@ pub struct RemoveArgs {
     pub dry_run: bool,
 }
 
+/// Select the loaded slot holding a group for --group removal.
+/// An explicit `--slot` index wins; otherwise the group name must
+/// occur in exactly one loaded slot. Shared with `rename --group`.
+pub(crate) fn select_group_slot(
+    datas: &[super_image_worker_core::SuperData],
+    name: &str,
+    slot: Option<u64>,
+) -> std::result::Result<usize, String> {
+    if let Some(idx) = slot {
+        let pos = datas
+            .iter()
+            .position(|d| d.metadata_slot == idx)
+            .ok_or_else(|| format!("metadata slot {idx} not loaded"))?;
+        if datas[pos].groups.iter().any(|g| g.name == name) {
+            Ok(pos)
+        } else {
+            Err(format!("slot {idx}: group '{name}' not found"))
+        }
+    } else {
+        let hits: Vec<usize> = datas
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.groups.iter().any(|g| g.name == name))
+            .map(|(p, _)| p)
+            .collect();
+        match hits.len() {
+            0 => Err(format!("group '{name}' not found")),
+            1 => Ok(hits[0]),
+            _ => {
+                let slots: Vec<u64> = hits.iter().map(|p| datas[*p].metadata_slot).collect();
+                Err(format!(
+                    "group '{name}' exists in several metadata slots {slots:?}; pass --slot <index> to select one"
+                ))
+            }
+        }
+    }
+}
+
 pub fn run(args: RemoveArgs) -> std::process::ExitCode {
-    let slot_opt: Option<&str> = match args.slot.as_str() {
-        "a" | "A" => Some("a"),
-        "b" | "B" => Some("b"),
-        "all" => None,
-        _ => None,
-    };
-    let mut data = match split_util::load_for_write(&args.image, &args.name, slot_opt) {
-        Ok(d) => d,
+    // --slot picks the metadata copy (index), --suffix the name letters.
+    let slot_idx = match split_util::parse_slot_opt(&args.slot) {
+        Ok(s) => s,
         Err(e) => {
             eprintln!("error: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let suffix = match split_util::parse_suffix_opt(&args.suffix) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let datas = match split_util::load_for_slot_filter(&args.image, slot_idx) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    // Select the owning slot: groups match by exact name, partitions
+    // through the suffix-aware resolver (exactly one hit required).
+    let slot_pos = if args.group {
+        match select_group_slot(&datas, &args.name, slot_idx) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+    } else {
+        match split_util::resolve_write_slot(&datas, &args.name, suffix, slot_idx) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+    };
+    let mut data = match datas.get(slot_pos).cloned() {
+        Some(d) => d,
+        None => {
+            eprintln!("error: metadata slot not found");
             return std::process::ExitCode::FAILURE;
         }
     };
@@ -167,16 +247,7 @@ pub fn run(args: RemoveArgs) -> std::process::ExitCode {
             }
         }
     } else {
-        let slot = match args.slot.as_str() {
-            "a" | "A" => Some("a"),
-            "b" | "B" => Some("b"),
-            "all" => None,
-            other => {
-                eprintln!("unknown slot: {other} (use a, b, all)");
-                return std::process::ExitCode::FAILURE;
-            }
-        };
-        let part_idx = match data.resolve_partition(&args.name, slot) {
+        let part_idx = match data.resolve_partition(&args.name, suffix) {
             Ok(i) => i,
             Err(e) => {
                 eprintln!("error: {e}");

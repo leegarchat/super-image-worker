@@ -26,7 +26,7 @@ impl Default for TsvOptions {
 #[allow(clippy::too_many_arguments)]
 pub fn print_human(
     data: &SuperData,
-    slot: Option<&str>,
+    suffix: Option<&str>,
     show_info: bool,
     show_groups: bool,
     show_devices: bool,
@@ -34,7 +34,7 @@ pub fn print_human(
     show_extents: bool,
     show_mapping: bool,
 ) {
-    let filtered = data.filter_by_slot(slot);
+    let filtered = data.filter_by_suffix(suffix);
     let suffixes = data.available_suffixes();
 
     if show_info {
@@ -184,8 +184,8 @@ pub fn print_human(
     }
 }
 
-pub fn json_value(data: &SuperData, slot: Option<&str>) -> serde_json::Value {
-    let filtered = data.filter_by_slot(slot);
+pub fn json_value(data: &SuperData, suffix: Option<&str>) -> serde_json::Value {
+    let filtered = data.filter_by_suffix(suffix);
     let suffixes = data.available_suffixes();
 
     let groups: Vec<serde_json::Value> = data.groups.iter().map(|g| {
@@ -254,8 +254,8 @@ pub fn json_value(data: &SuperData, slot: Option<&str>) -> serde_json::Value {
     })
 }
 
-pub fn print_json(data: &SuperData, slot: Option<&str>) {
-    let root = json_value(data, slot);
+pub fn print_json(data: &SuperData, suffix: Option<&str>) {
+    let root = json_value(data, suffix);
     println!(
         "{}",
         serde_json::to_string_pretty(&root).unwrap_or_else(|_| "{}".to_string())
@@ -265,15 +265,15 @@ pub fn print_json(data: &SuperData, slot: Option<&str>) {
 /// Multi-slot JSON: single slot prints the plain object (backward
 /// compatible); several slots print `{"slots": [...]}` plus a merged
 /// partition count, mirroring `lpdump -a`.
-pub fn print_json_slots(datas: &[SuperData], slot: Option<&str>) {
+pub fn print_json_slots(datas: &[SuperData], suffix: Option<&str>) {
     if datas.len() == 1 {
         if let Some(d) = datas.first() {
-            print_json(d, slot);
+            print_json(d, suffix);
         }
         return;
     }
     let slots: Vec<serde_json::Value> =
-        datas.iter().map(|d| json_value(d, slot)).collect();
+        datas.iter().map(|d| json_value(d, suffix)).collect();
     let total_partitions: usize = datas.iter().map(|d| d.partitions.len()).sum();
     let first = datas.first();
     let root = serde_json::json!({
@@ -325,8 +325,8 @@ fn tsv_column(data: &SuperData, p: &super_image_worker_core::Partition, col: &st
     }
 }
 
-pub fn print_tsv(data: &SuperData, slot: Option<&str>, opts: &TsvOptions) {
-    let filtered = data.filter_by_slot(slot);
+pub fn print_tsv(data: &SuperData, suffix: Option<&str>, opts: &TsvOptions) {
+    let filtered = data.filter_by_suffix(suffix);
 
     if opts.header {
         println!("{}", opts.columns.join("\t"));
@@ -342,8 +342,8 @@ pub fn print_tsv(data: &SuperData, slot: Option<&str>, opts: &TsvOptions) {
     }
 }
 
-pub fn print_env(data: &SuperData, slot: Option<&str>) {
-    let filtered = data.filter_by_slot(slot);
+pub fn print_env(data: &SuperData, suffix: Option<&str>) {
+    let filtered = data.filter_by_suffix(suffix);
     let suffixes = data.available_suffixes();
 
     println!("SUPER_IMAGE_FORMAT={}", data.image_format);

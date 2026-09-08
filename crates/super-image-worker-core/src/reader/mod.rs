@@ -30,25 +30,6 @@ pub struct SuperData {
     pub devices: Vec<BlockDevice>,
 }
 
-/// Map a partition suffix (`a`/`b`) to a metadata slot index
-/// (AOSP convention: slot 0 <-> `_a`, slot 1 <-> `_b`).
-pub fn suffix_to_slot(suffix: &str) -> Option<u64> {
-    match suffix {
-        "a" | "A" => Some(0),
-        "b" | "B" => Some(1),
-        _ => None,
-    }
-}
-
-/// Map a metadata slot index back to its conventional suffix.
-pub fn slot_to_suffix(slot: u64) -> Option<&'static str> {
-    match slot {
-        0 => Some("a"),
-        1 => Some("b"),
-        _ => None,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn build_super_data(
     image_format: String,
@@ -285,7 +266,10 @@ impl SuperData {
         suffixes
     }
 
-    pub fn filter_by_slot(&self, suffix: Option<&str>) -> Vec<&Partition> {
+    /// Filter partitions by name suffix (`a`/`b`); slotless partitions
+    /// always match. This is purely a name filter and is independent of
+    /// which metadata slot was loaded (--slot selects the slot).
+    pub fn filter_by_suffix(&self, suffix: Option<&str>) -> Vec<&Partition> {
         match suffix {
             None => self.partitions.iter().collect(),
             Some(sfx) => self
@@ -296,30 +280,32 @@ impl SuperData {
         }
     }
 
-    /// Resolve a partition by full name or base name + slot filter.
-    /// `slot` is None (all), Some("a") or Some("b").
-    /// Slot-suffixed lookup: "system" + a -> "system_a".
+    /// Resolve a partition by full name or base name + suffix filter.
+    /// `suffix` is None (all), Some("a") or Some("b") and matches the
+    /// trailing `_a`/`_b` letters only; it never selects a metadata slot
+    /// (that is `--slot`, applied by the caller when loading).
+    /// Suffix-filtered lookup: "system" + a -> "system_a".
     /// Slotless partitions match regardless of filter.
     pub fn resolve_partition(
         &self,
         name: &str,
-        slot: Option<&str>,
+        suffix: Option<&str>,
     ) -> std::result::Result<usize, Error> {
         // Exact match first.
         if let Some(idx) = self.partitions.iter().position(|p| p.name == name) {
             return Ok(idx);
         }
-        // Base-name + slot match (handles Virtual A/B slotless + A/B).
+        // Base-name + suffix match (handles Virtual A/B slotless + A/B).
         let mut candidates: Vec<usize> = Vec::new();
         for (idx, p) in self.partitions.iter().enumerate() {
             if Self::strip_suffix(&p.name) != name {
                 continue;
             }
-            match slot {
+            match suffix {
                 Some(sfx) => {
                     match Self::find_suffix(&p.name) {
                         Some(s) if s == sfx => candidates.push(idx),
-                        None => candidates.push(idx), // slotless matches any slot
+                        None => candidates.push(idx), // slotless matches any suffix
                         _ => {}
                     }
                 }
@@ -336,7 +322,7 @@ impl SuperData {
                     .map(|p| p.name.as_str())
                     .collect();
                 Err(Error::Invalid(format!(
-                    "ambiguous name '{name}', matches: {names:?}. Use full name or --slot"
+                    "ambiguous name '{name}', matches: {names:?}. Use full name or --suffix"
                 )))
             }
         }

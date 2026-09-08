@@ -21,10 +21,21 @@ QUICK WORKFLOWS:\n\
       --partition system_a:readonly:g:system.img # Build an image (lpmake analog)\n\
   super-image-worker add super.img -n part_a -p file.img   # Append a partition + payload\n\
   sudo super-image-worker connect super.img -p part_a  # Loop-mount a partition (Linux/Android)\n\n\
-SLOTS:\n\
-  Most commands accept --slot <a|b|all> (plus base-name resolution, e.g.\n\
-  `-p system -s a` matches `system_a`; slotless Virtual A/B partitions match\n\
-  any slot). `make` instead takes --slot <0|1|a|b|all> as metadata slot indices.\n\n\
+SLOT vs SUFFIX (two independent selectors):\n\
+  -s/--slot is the primary selector: which LP metadata copy is used.\n\
+    Values: 0|a|A|_a|_A (= slot 0), 1|b|B|_b|_B (= slot 1), plain 2..7,\n\
+    or all (default = every valid slot, like `lpdump -a`). Letters are\n\
+    just conveniences for the index, never read from partition names.\n\
+  --suffix (long flag only) is an extra name filter: keeps only\n\
+    partitions with that trailing letter (a, b, or all, default all);\n\
+    slotless Virtual A/B partitions always match. Plus base-name\n\
+    resolution, e.g. `-p system --suffix a` matches `system_a`.\n\
+  Example: metadata slot 0 holding both _a and _b entries is read with\n\
+    `--slot 0 --suffix b` for the _b rows of slot 0.\n\
+  `read` is the exception: -s there is --size, so both --slot and\n\
+    --suffix are long-only.\n\
+  `make` takes --slot for the slots to generate (same aliases); it has\n\
+    no --suffix (names are created).\n\n\
 SPLIT / RETROFIT IMAGES:\n\
   Retrofit super spans several files (e.g. system + vendor). Pass secondaries\n\
   with --device on info/extract/read/add/resize/create:\n\
@@ -36,7 +47,9 @@ ENVIRONMENT:\n\
   make/add/resize/remove/rename/create - raw images only for writing (never sparse)\n\
   info/extract/read  - work everywhere, no root for read-only operations\n\n\
 EXIT CODES: 0 success, 1 generic failure, 2 bad --get key/field (info).\n\
-Full per-command manual: `super-image-worker <command> --help`"
+Every subcommand ships its own detailed manual with formats, selectors,\n\
+examples and edge cases: `super-image-worker <command> --help`\n\
+(e.g. `super-image-worker info --help`, `super-image-worker make --help`)"
 )]
 pub struct Cli {
     #[command(subcommand)]

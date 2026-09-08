@@ -84,7 +84,8 @@ pub struct MakeArgs {
     #[arg(long = "partition")]
     pub partition: Vec<String>,
 
-    /// Target metadata slot(s): 0, 1, a, b, or all (default: 0).
+    /// Target metadata slot(s): 0, 1, ... or all (default: 0).
+    /// Letter aliases: a/A/_a/_A = 0, b/B/_b/_B = 1.
     #[arg(long, default_value = "0")]
     pub slot: String,
 
@@ -332,8 +333,8 @@ fn zero_fill(handle: &mut File, size: u64) -> Result<(), String> {
 fn parse_slots(s: &str, slot_count: u32) -> Result<Vec<u64>, String> {
     let all: Vec<u64> = (0..slot_count as u64).collect();
     match s.trim() {
-        "0" | "a" | "A" => Ok(vec![0]),
-        "1" | "b" | "B" => {
+        "0" | "a" | "A" | "_a" | "_A" => Ok(vec![0]),
+        "1" | "b" | "B" | "_b" | "_B" => {
             if slot_count < 2 {
                 return Err("slot 1 requested but metadata has only 1 slot".into());
             }

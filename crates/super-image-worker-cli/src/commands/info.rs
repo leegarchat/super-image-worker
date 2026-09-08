@@ -1,6 +1,6 @@
+use super::split_util;
 use crate::output::{table, table::TsvOptions};
 use clap;
-use super_image_worker_core::{load_super_all, load_super_in_slot, suffix_to_slot};
 use std::path::PathBuf;
 
 #[derive(clap::Args)]
@@ -22,8 +22,13 @@ OUTPUT FORMATS (--format):\n\
   env    - `SUPER_*` shell variables for `eval $(super-image-worker info --format env)`\n\n\
 SECTION FLAGS: -i/-p/-e/-g/-d/-m pick info/partitions/extents/groups/devices/\n\
 mapping; -a/--all or no flags shows everything. -b prints raw bytes in TSV.\n\n\
-SLOT FILTER (--slot a|b|all): keeps only partitions of that slot suffix;\n\
-slotless (Virtual A/B) partitions always match.\n\n\
+SLOT vs SUFFIX (two independent selectors):\n\
+  --slot <index|all> picks which LP metadata copy is read (0, 1, ...;\n\
+            default all = every valid slot, like `lpdump -a`)\n\
+  --suffix <a|b|all> keeps only partitions with that name suffix\n\
+            (slotless Virtual A/B partitions always match)\n\
+E.g. on an image where metadata slot 0 holds both _a and _b entries:\n\
+  --slot 0 --suffix b shows the _b rows of slot 0.\n\n\
 PRECISION EXTRACTION (--get <key>, no trailing newline, exit 2 on bad key):\n\
   partitions.<name>.{size,size_human,sectors,group,first_phys_offset_hex,...}\n\
   partitions.<name>.extent.<idx>.{type,sectors,phys_offset_hex,device,...}\n\
@@ -36,7 +41,7 @@ SPLIT / RETROFIT: pass secondaries with repeatable --device:\n\
   printed above the selected format.\n\n\
 EXAMPLES:\n\
   super-image-worker info super.img                         # Everything, human tables\n\
-  super-image-worker info super.img -s a -f tsv -H -c name,size_bytes | awk '{print $1}'\n\
+  super-image-worker info super.img --suffix a -f tsv -H -c name,size_bytes | awk '{print $1}'\n\
   super-image-worker info super.img -f json | jq '.partitions[] | .name'\n\
   eval $(super-image-worker info super.img -f env); echo $SUPER_PART_SYSTEM_A_SIZE\n\
   super-image-worker info super.img --get partitions.system_a.size\n\
@@ -51,9 +56,15 @@ pub struct InfoArgs {
     #[arg(short, long, default_value = "human")]
     pub format: String,
 
-    /// Filter by slot suffix: a, b, or all
-    #[arg(short, long, default_value = "all")]
+    /// Metadata slot (-s): 0|a, 1|b, ... or all (default: all).
+    /// Selects which LP metadata copy is used; a/A/_a = slot 0, b/B/_b = slot 1.
+    #[arg(short = 's', long, default_value = "all")]
     pub slot: String,
+
+    /// Extra name filter (long flag only): keeps partitions with that
+    /// name suffix (a, b, or all, default: all). Slotless partitions always match.
+    #[arg(long, default_value = "all")]
+    pub suffix: String,
 
     /// Suppress column headers in TSV mode
     #[arg(short = 'H', long)]
@@ -120,40 +131,28 @@ pub fn run(args: InfoArgs) -> std::process::ExitCode {
         return std::process::ExitCode::SUCCESS;
     }
 
-    let slot = match args.slot.as_str() {
-        "a" | "A" => Some("a"),
-        "b" | "B" => Some("b"),
-        "all" => None,
-        other => {
-            eprintln!("unknown slot: {other} (use a, b, all)");
+    // Two independent selectors: --slot picks the metadata copy
+    // (index), --suffix filters the _a/_b name letters inside it.
+    let slot = match split_util::parse_slot_opt(&args.slot) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let suffix = match split_util::parse_suffix_opt(&args.suffix) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
 
-    // Slot-aware loading: `--slot a|b` opens that metadata slot
-    // (0 <-> _a, 1 <-> _b); `--slot all` opens every valid slot
-    // (mirrors `lpdump -a`). This fixes dual-slot images (e.g. shiba
-    // current slot _b) where the old first-valid-slot loader only
-    // exposed slot 0 partitions, so `-s b` showed zero rows.
-    let datas = if let Some(sfx) = slot {
-        match suffix_to_slot(sfx).map(|idx| load_super_in_slot(&args.image, idx)) {
-            Some(Ok(d)) => vec![d],
-            Some(Err(e)) => {
-                eprintln!("error: {e}");
-                return std::process::ExitCode::FAILURE;
-            }
-            None => {
-                eprintln!("unknown slot: {sfx}");
-                return std::process::ExitCode::FAILURE;
-            }
-        }
-    } else {
-        match load_super_all(&args.image) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("error: {e}");
-                return std::process::ExitCode::FAILURE;
-            }
+    let datas = match split_util::load_for_slot_filter(&args.image, slot) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return std::process::ExitCode::FAILURE;
         }
     };
 
@@ -200,11 +199,9 @@ pub fn run(args: InfoArgs) -> std::process::ExitCode {
         }
     }
 
-    // Suffix filter applies inside each loaded metadata slot. It is
-    // redundant for slot-per-suffix images (shiba slot 1 holds only
-    // `_b`) but required for mixed slots (marble slot 0 holds `_a`
-    // with data plus empty `_b` placeholders).
-    let inner_filter: Option<&str> = slot;
+    // The suffix filter applies inside each loaded metadata slot
+    // (e.g. mixed slots holding both `_a` data and empty `_b`
+    // placeholders).
 
     match args.format.as_str() {
         "human" => {
@@ -217,7 +214,7 @@ pub fn run(args: InfoArgs) -> std::process::ExitCode {
                 }
                 table::print_human(
                     data,
-                    inner_filter,
+                    suffix,
                     show_all || args.info,
                     show_all || args.groups,
                     show_all || args.devices,
@@ -227,7 +224,7 @@ pub fn run(args: InfoArgs) -> std::process::ExitCode {
                 );
             }
         }
-        "json" => table::print_json_slots(&datas, slot),
+        "json" => table::print_json_slots(&datas, suffix),
         "tsv" => {
             let columns = args
                 .columns
@@ -254,7 +251,7 @@ pub fn run(args: InfoArgs) -> std::process::ExitCode {
                     bytes: opts.bytes,
                 };
                 let _ = &mut opts_ref;
-                table::print_tsv(data, inner_filter, &opts_ref);
+                table::print_tsv(data, suffix, &opts_ref);
                 first = false;
             }
         }
@@ -263,7 +260,7 @@ pub fn run(args: InfoArgs) -> std::process::ExitCode {
                 if datas.len() > 1 {
                     println!("# metadata_slot={} offset=0x{:x}", data.metadata_slot, data.metadata_offset);
                 }
-                table::print_env(data, inner_filter);
+                table::print_env(data, suffix);
             }
         }
         other => {

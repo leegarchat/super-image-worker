@@ -19,8 +19,10 @@ PARALLELISM: partitions are extracted concurrently with rayon; every thread\n\
 opens an isolated image handle, so there are no Seek races. Errors are\n\
 collected per partition: failed outputs are deleted, the rest are kept,\n\
 and the exit code is still FAILURE if anything failed.\n\n\
-SELECTION: -p takes a full name (system_a) or a base name plus --slot\n\
-(system -s a). Without -p, --slot filters the whole table (a|b|all).\n\
+SELECTION (--slot picks the metadata copy, --suffix the name letters):\n\
+-p takes a full name (system_a) or a base name plus --suffix\n\
+(system --suffix a). Without -p, --suffix filters the whole table (a|b|all)\n\
+inside each loaded metadata slot (--slot 0|1|...|all, default all).\n\
 --dry-run lists name + size without writing. Existing files are skipped\n\
 unless --force overwrites them.\n\n\
 SPLIT / RETROFIT: repeatable --device (vendor=path or auto-matched path).\n\
@@ -28,8 +30,9 @@ A partition touching an unbound device fails with the exact --device string.\n\n
 EXAMPLES:\n\
   super-image-worker extract super.img -o ./output              # Unpack everything\n\
   super-image-worker extract super.img -o ./out -p system_a     # One partition\n\
-  super-image-worker extract super.img -o ./out -s a            # Slot A only\n\
-  super-image-worker extract super.img -o ./out -p system -s b  # Base name + slot\n\
+  super-image-worker extract super.img -o ./out --suffix a      # Suffix A only\n\
+  super-image-worker extract super.img -o ./out -p system --suffix b  # Base name + suffix\n\
+  super-image-worker extract super.img -o ./out --slot 1        # Metadata slot 1 only\n\
   super-image-worker extract sys.img -o ./out --device vendor=vend.img  # Split image\n\
   super-image-worker extract super.img --dry-run                # Names + sizes only\n\
   super-image-worker extract super.img -o ./out --force         # Overwrite outputs"
@@ -43,13 +46,19 @@ pub struct ExtractArgs {
     pub output: PathBuf,
 
     /// Extract only this partition name (e.g., system_a, vendor_b).
-    /// Accepts base names together with --slot (e.g., -p system -s a).
+    /// Accepts base names together with --suffix (e.g., -p system --suffix a).
     #[arg(short, long)]
     pub partition: Option<String>,
 
-    /// Filter by slot suffix: a, b, or all
-    #[arg(short, long, default_value = "all")]
+    /// Metadata slot (-s): 0|a, 1|b, ... or all (default: all).
+    /// Selects which LP metadata copy is used; a/A/_a = slot 0, b/B/_b = slot 1.
+    #[arg(short = 's', long, default_value = "all")]
     pub slot: String,
+
+    /// Extra name filter (long flag only): keeps partitions with that
+    /// name suffix (a, b, or all, default: all). Slotless partitions always match.
+    #[arg(long, default_value = "all")]
+    pub suffix: String,
 
     /// Bind secondary block devices for split/retrofit images.
     /// Repeatable: `--device vendor=path` or `--device path` (auto-match).
@@ -66,18 +75,22 @@ pub struct ExtractArgs {
 }
 
 pub fn run(args: ExtractArgs) -> std::process::ExitCode {
-    let slot = match args.slot.as_str() {
-        "a" | "A" => Some("a"),
-        "b" | "B" => Some("b"),
-        "all" => None,
-        other => {
-            eprintln!("unknown slot: {other} (use a, b, all)");
+    // --slot picks the metadata copy (index), --suffix the name letters.
+    let slot = match split_util::parse_slot_opt(&args.slot) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let suffix = match split_util::parse_suffix_opt(&args.suffix) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
 
-    // Slot-aware loading: `-s b` extracts from metadata slot 1,
-    // `-s all` from every valid slot (dual-slot images).
     let datas = match split_util::load_for_slot_filter(&args.image, slot) {
         Ok(v) => v,
         Err(e) => {
@@ -86,11 +99,11 @@ pub fn run(args: ExtractArgs) -> std::process::ExitCode {
         }
     };
 
-    // Resolve partition list (supports base name + slot, across slots).
+    // Resolve partition list (supports base name + suffix, across slots).
     // Each entry tracks its owning metadata slot for correct extents.
     let mut names: Vec<(usize, String)> = Vec::new();
     if let Some(ref name) = args.partition {
-        match split_util::find_partition_across(&datas, name, slot) {
+        match split_util::find_partition_across(&datas, name, suffix) {
             Ok((di, pi)) => {
                 if let Some(p) = datas.get(di).and_then(|d| d.partitions.get(pi)) {
                     names.push((di, p.name.clone()));
@@ -103,9 +116,9 @@ pub fn run(args: ExtractArgs) -> std::process::ExitCode {
         }
     } else {
         for (di, data) in datas.iter().enumerate() {
-            // Suffix filter still applies inside each slot (mixed slots
-            // hold both `_a` and empty `_b` placeholders).
-            for p in data.filter_by_slot(slot) {
+            // Suffix filter applies inside each loaded slot (mixed slots
+            // hold both `_a` data and empty `_b` placeholders).
+            for p in data.filter_by_suffix(suffix) {
                 names.push((di, p.name.clone()));
             }
         }

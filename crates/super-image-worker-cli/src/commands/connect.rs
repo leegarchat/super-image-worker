@@ -92,10 +92,11 @@ The created device behaves like any block device:\n\
   - Check filesystem: sudo fsck /dev/loop14\n\
   - Read data: sudo dd if=/dev/loop14 of=part.img\n\
 Pair with `disconnect` for teardown (matched by image path + offset + size).\n\n\
-NAME RESOLUTION: full name (-p odm_a) or base name plus --slot (-p system -s a).\n\n\
+NAME RESOLUTION: full name (-p odm_a) or base name plus --suffix\n\
+(-p system --suffix a); -s/--slot <0|a|1|b|...|all> picks the metadata copy.\n\n\
 EXAMPLES:\n\
   sudo super-image-worker connect super.img -p odm_a\n\
-  sudo super-image-worker connect super.img -p system -s a\n\
+  sudo super-image-worker connect super.img -p system --suffix a\n\
   sudo super-image-worker connect super.img -p vendor_b\n\
   sudo super-image-worker disconnect super.img -p odm_a"
 )]
@@ -107,10 +108,15 @@ pub struct ConnectArgs {
     #[arg(short, long)]
     pub partition: String,
 
-    /// Filter by slot suffix: a, b, or all
-    /// Use when partition name is ambiguous (e.g., 'system' matches system_a and system_b)
-    #[arg(short, long, default_value = "all")]
+    /// Metadata slot (-s): 0|a, 1|b, ... or all (default: all).
+    /// Selects which LP metadata copy is read, independent of names.
+    #[arg(short = 's', long, default_value = "all")]
     pub slot: String,
+
+    /// Filter by partition name suffix: a, b, or all (default: all).
+    /// Use when partition name is ambiguous (e.g., 'system' matches system_a and system_b)
+    #[arg(long, default_value = "all")]
+    pub suffix: String,
 }
 
 #[derive(Args)]
@@ -123,7 +129,7 @@ offset and size (via LOOP_GET_STATUS64 and\n\
 Single-extent partitions only (mirrors `connect`). Requires root.\n\n\
 EXAMPLES:\n\
   sudo super-image-worker disconnect super.img -p odm_a\n\
-  sudo super-image-worker disconnect super.img -p system -s a"
+  sudo super-image-worker disconnect super.img -p system --suffix a"
 )]
 pub struct DisconnectArgs {
     /// Path to super image (same as used in 'connect')
@@ -133,9 +139,13 @@ pub struct DisconnectArgs {
     #[arg(short, long)]
     pub partition: String,
 
-    /// Filter by slot suffix: a, b, or all
-    #[arg(short, long, default_value = "all")]
+    /// Metadata slot (-s) used at connect time: 0|a, 1|b, ... or all (default: all)
+    #[arg(short = 's', long, default_value = "all")]
     pub slot: String,
+
+    /// Name suffix filter used at connect time (long flag only): a, b, or all (default: all)
+    #[arg(long, default_value = "all")]
+    pub suffix: String,
 }
 
 fn check_root() -> Result<(), String> {
@@ -262,13 +272,14 @@ fn find_loop_for_partition(image_path: &str, offset: u64, size: u64) -> Result<i
     ))
 }
 
-fn parse_slot_filter(slot: &str) -> Result<Option<&str>, String> {
-    match slot {
-        "a" | "A" => Ok(Some("a")),
-        "b" | "B" => Ok(Some("b")),
-        "all" => Ok(None),
-        other => Err(format!("unknown slot: {other} (use a, b, all)")),
-    }
+/// Parse --slot/--suffix for connect/disconnect (shared shape).
+fn parse_selectors<'a>(
+    args_slot: &str,
+    args_suffix: &'a str,
+) -> Result<(Option<u64>, Option<&'a str>), String> {
+    let slot = split_util::parse_slot_opt(args_slot)?;
+    let suffix = split_util::parse_suffix_opt(args_suffix)?;
+    Ok((slot, suffix))
 }
 
 pub fn run_connect(args: ConnectArgs) -> std::process::ExitCode {
@@ -277,14 +288,14 @@ pub fn run_connect(args: ConnectArgs) -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
-    let slot_filter = match parse_slot_filter(&args.slot) {
-        Ok(s) => s,
+    let (slot, suffix) = match parse_selectors(&args.slot, &args.suffix) {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("error: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
-    let datas = match split_util::load_for_slot_filter(&args.image, slot_filter) {
+    let datas = match split_util::load_for_slot_filter(&args.image, slot) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("error: {e}");
@@ -292,7 +303,7 @@ pub fn run_connect(args: ConnectArgs) -> std::process::ExitCode {
         }
     };
     let (slot_pos, part_idx) =
-        match split_util::find_partition_across(&datas, &args.partition, slot_filter) {
+        match split_util::find_partition_across(&datas, &args.partition, suffix) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -406,14 +417,14 @@ pub fn run_disconnect(args: DisconnectArgs) -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
-    let slot_filter = match parse_slot_filter(&args.slot) {
-        Ok(s) => s,
+    let (slot, suffix) = match parse_selectors(&args.slot, &args.suffix) {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("error: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
-    let datas = match split_util::load_for_slot_filter(&args.image, slot_filter) {
+    let datas = match split_util::load_for_slot_filter(&args.image, slot) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("error: {e}");
@@ -421,7 +432,7 @@ pub fn run_disconnect(args: DisconnectArgs) -> std::process::ExitCode {
         }
     };
     let (slot_pos, part_idx) =
-        match split_util::find_partition_across(&datas, &args.partition, slot_filter) {
+        match split_util::find_partition_across(&datas, &args.partition, suffix) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("error: {e}");
