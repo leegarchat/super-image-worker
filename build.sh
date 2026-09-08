@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 DIST_DIR="$SCRIPT_DIR/dist"
+PUSH_DIR="$SCRIPT_DIR/target/push"
 BIN_NAME="super-image-worker"
 
 TARGET_X64="x86_64-unknown-linux-musl"
@@ -41,6 +42,12 @@ Examples:
   $0 --cargo --arch x64
   $0 --cross --arch arm64
   $0 --arch all
+
+Outputs:
+  dist/                      Static binaries super-image-worker-linux-*
+  target/push/               Push-ready copies {name}_{arch} (x64, x86,
+                             arm64, arm32), e.g. for: adb push
+                             target/push/super-image-worker_arm64 /data/local/
 EOF
     exit 0
 }
@@ -201,6 +208,7 @@ mkdir -p "$DIST_DIR"
 build_target() {
     local target="$1"
     local output_name="$2"
+    local short_arch="$3"
 
     echo ""
     echo "------------------------------------------------------------"
@@ -247,31 +255,39 @@ build_target() {
         local size
         size=$(stat -c%s "$dst_bin" 2>/dev/null || stat -f%z "$dst_bin")
         echo "Success: $dst_bin ($size bytes)"
+
+        # Post-process: adb-push-ready copy as target/push/{name}_{arch}
+        # (e.g. target/push/super-image-worker_arm64 for `adb push` to
+        # /data/local on devices). target/ is gitignored; push/ is kept
+        # across runs (only overwritten per built arch).
+        mkdir -p "$PUSH_DIR"
+        cp "$dst_bin" "$PUSH_DIR/${BIN_NAME}_${short_arch}"
+        echo "Push copy: $PUSH_DIR/${BIN_NAME}_${short_arch}"
     else
         echo "Error: compiled binary not found: $src_bin"
         exit 1
     fi
 }
 
-# Build tasks
+# Build tasks (3rd arg = short arch for target/push/{name}_{arch})
 case "$SELECTED_ARCH" in
     all)
-        build_target "$TARGET_X64"   "linux-x86_64"
-        build_target "$TARGET_X86"   "linux-x86"
-        build_target "$TARGET_ARM64" "linux-arm64"
-        build_target "$TARGET_ARM32" "linux-arm32"
+        build_target "$TARGET_X64"   "linux-x86_64" "x64"
+        build_target "$TARGET_X86"   "linux-x86"    "x86"
+        build_target "$TARGET_ARM64" "linux-arm64"  "arm64"
+        build_target "$TARGET_ARM32" "linux-arm32"  "arm32"
         ;;
     x64)
-        build_target "$TARGET_X64"   "linux-x86_64"
+        build_target "$TARGET_X64"   "linux-x86_64" "x64"
         ;;
     x86)
-        build_target "$TARGET_X86"   "linux-x86"
+        build_target "$TARGET_X86"   "linux-x86"    "x86"
         ;;
     arm64)
-        build_target "$TARGET_ARM64" "linux-arm64"
+        build_target "$TARGET_ARM64" "linux-arm64"  "arm64"
         ;;
     arm32)
-        build_target "$TARGET_ARM32" "linux-arm32"
+        build_target "$TARGET_ARM32" "linux-arm32"  "arm32"
         ;;
     *)
         echo "Error: unknown architecture '$SELECTED_ARCH'"
@@ -283,4 +299,6 @@ echo ""
 echo "============================================================"
 echo "Done! Generated binaries in dist/:"
 ls -lh "$DIST_DIR"
+echo "Push-ready copies in target/push/ ({name}_{arch} for adb push):"
+ls -lh "$PUSH_DIR"
 echo "============================================================"

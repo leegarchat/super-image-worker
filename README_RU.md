@@ -97,18 +97,27 @@ crates/super-image-worker-cli/    Бинарный крейт (clap derive):
 git clone https://github.com/leegarchat/super-image-worker.git
 cd super-image-worker
 
-# Быстрая локальная сборка
+# Быстрая локальная сборка (хостовый таргет, динамическая)
 cargo build --release
 # -> target/release/super-image-worker (~1.2 МБ, LTO + stripped)
 
-# Статические мультиархитектурные бинарники в dist/
+# Статические мультиархитектурные сборки через build.sh (musl, stripped):
+#   --cargo | --cross | --auto   метод сборки (auto = cross при наличии контейнеров, иначе cargo)
+#   --arch all|x64|x86|arm64|arm32
 ./build.sh --cargo --arch x64      # x86_64-unknown-linux-musl
+./build.sh --cross --arch arm64    # aarch64 через контейнеры
 ./build.sh --arch all              # x86_64, x86, aarch64, armv7
 
 # Проверки
 cargo clippy --all-targets -- -D warnings
 cargo test
 ```
+
+Выходы сборки:
+
+* `dist/` — статические бинарники `super-image-worker-linux-*` (x86_64, x86, arm64, arm32).
+* `target/push/` — push-копии `{name}_{arch}` (`x64`, `x86`, `arm64`, `arm32`), обновляются под собранную архитектуру, например для устройств:
+  `adb push target/push/super-image-worker_arm64 /data/local/` (`dist/` и `target/` в gitignore).
 
 ---
 

@@ -97,18 +97,27 @@ To prevent denial-of-service, unbounded memory growth, and arithmetic corruption
 git clone https://github.com/leegarchat/super-image-worker.git
 cd super-image-worker
 
-# Fast local build
+# Fast local build (host target, dynamic)
 cargo build --release
 # -> target/release/super-image-worker (~1.2 MB, LTO + stripped)
 
-# Static multi-arch binaries into dist/
+# Static multi-arch builds via build.sh (musl, stripped):
+#   --cargo | --cross | --auto   build method (auto = cross if containers exist, else cargo)
+#   --arch all|x64|x86|arm64|arm32
 ./build.sh --cargo --arch x64      # x86_64-unknown-linux-musl
+./build.sh --cross --arch arm64    # aarch64 via containers
 ./build.sh --arch all              # x86_64, x86, aarch64, armv7
 
 # Checks
 cargo clippy --all-targets -- -D warnings
 cargo test
 ```
+
+Build outputs:
+
+* `dist/` — static binaries `super-image-worker-linux-*` (x86_64, x86, arm64, arm32).
+* `target/push/` — push-ready copies `{name}_{arch}` (`x64`, `x86`, `arm64`, `arm32`), refreshed per built arch, e.g. for devices:
+  `adb push target/push/super-image-worker_arm64 /data/local/` (both `dist/` and `target/` are gitignored).
 
 ---
 
