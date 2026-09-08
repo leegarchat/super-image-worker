@@ -1,5 +1,6 @@
+use super::split_util;
 use clap::Args;
-use super_image_worker_core::{LP_SECTOR_SIZE, LP_TARGET_TYPE_LINEAR, LpWriter, load_super};
+use super_image_worker_core::{LP_SECTOR_SIZE, LP_TARGET_TYPE_LINEAR, LpWriter};
 use std::fs::File;
 use std::path::PathBuf;
 
@@ -82,7 +83,7 @@ fn parse_size(s: &str) -> Result<u64, String> {
 }
 
 pub fn run(args: CreateArgs) -> std::process::ExitCode {
-    let mut data = match load_super(&args.image) {
+    let mut data = match split_util::load_for_write(&args.image, &args.name, None) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("error: {e}");
