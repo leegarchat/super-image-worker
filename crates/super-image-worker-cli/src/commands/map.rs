@@ -1,6 +1,8 @@
+use super::split_util;
 use clap::Args;
-use super_image_worker_core::{LP_TARGET_TYPE_LINEAR, LP_TARGET_TYPE_ZERO, load_super};
+use super_image_worker_core::{LP_TARGET_TYPE_LINEAR, LP_TARGET_TYPE_ZERO};
 use std::ffi::CString;
+use std::os::unix::fs::FileTypeExt;
 use std::path::PathBuf;
 
 const DM_IOCTL_VERSION: u32 = 4;
@@ -14,7 +16,6 @@ const DM_DEV_SUSPEND: u64 = 0xc138fd06;
 const DM_DEV_STATUS: u64 = 0xc138fd07;
 
 const DM_READONLY_FLAG: u32 = 1;
-const DM_ACTIVE_PRESENT_FLAG: u32 = 4;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -277,42 +278,169 @@ pub struct UnmapArgs {
     pub partition: String,
 }
 
-fn resolve_partition(
-    data: &super_image_worker_core::SuperData,
-    name: &str,
-    slot: &str,
-) -> Result<super_image_worker_core::Partition, String> {
-    let slot_filter = match slot {
-        "a" | "A" => Some("a"),
-        "b" | "B" => Some("b"),
-        "all" => None,
-        other => return Err(format!("unknown slot: {other} (use a, b, all)")),
-    };
+fn parse_slot_filter(slot: &str) -> Result<Option<&str>, String> {
+    match slot {
+        "a" | "A" => Ok(Some("a")),
+        "b" | "B" => Ok(Some("b")),
+        "all" => Ok(None),
+        other => Err(format!("unknown slot: {other} (use a, b, all)")),
+    }
+}
 
-    let candidates: Vec<&super_image_worker_core::Partition> = data
-        .partitions
-        .iter()
-        .filter(|p| {
-            if p.name != name && super_image_worker_core::SuperData::strip_suffix(&p.name) != name {
-                return false;
-            }
-            if let Some(sfx) = slot_filter {
-                super_image_worker_core::SuperData::find_suffix(&p.name).is_none_or(|s| s == sfx)
-            } else {
-                true
-            }
-        })
-        .collect();
+/// Loop node resolution shared with `connect`: Android keeps loops at
+/// `/dev/block/loopN`, stock Linux at `/dev/loopN`.
+fn loop_node(nr: i32) -> String {
+    let a = format!("/dev/loop{nr}");
+    if std::path::Path::new(&a).exists() {
+        return a;
+    }
+    let b = format!("/dev/block/loop{nr}");
+    if std::path::Path::new(&b).exists() {
+        return b;
+    }
+    a
+}
 
-    match candidates.len() {
-        0 => Err(format!("partition '{name}' not found")),
-        1 => Ok(candidates[0].clone()),
-        _ => {
-            let names: Vec<&str> = candidates.iter().map(|p| p.name.as_str()).collect();
-            Err(format!(
-                "ambiguous name '{name}', matches: {names:?}. Use full name or --slot"
-            ))
+fn open_loop_node(nr: i32, flags: i32) -> i32 {
+    let primary = loop_node(nr);
+    if let Ok(c) = CString::new(primary.as_str()) {
+        let fd = unsafe { libc::open(c.as_ptr(), flags) };
+        if fd >= 0 {
+            return fd;
         }
+    }
+    let alt = if primary.starts_with("/dev/block/loop") {
+        format!("/dev/loop{nr}")
+    } else {
+        format!("/dev/block/loop{nr}")
+    };
+    if let Ok(c) = CString::new(alt.as_str()) {
+        unsafe { libc::open(c.as_ptr(), flags) }
+    } else {
+        -1
+    }
+}
+
+fn is_block_device(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.file_type().is_block_device())
+        .unwrap_or(false)
+}
+
+/// dm-linear needs a block device as its base. A regular file image
+/// (e.g. `/data/local/super.img`) is not directly mappable, so back it
+/// by a whole-file loop device and return the loop node. Block devices
+/// pass through unchanged (canonicalized).
+/// Returns `(base_path, backing_loop_nr_or_None)`.
+fn ensure_block_base(image: &std::path::Path) -> Result<(String, Option<i32>), String> {
+    if is_block_device(image) {
+        let abs = std::fs::canonicalize(image)
+            .map_err(|e| format!("failed to resolve block device: {e}"))?;
+        return Ok((abs.to_string_lossy().to_string(), None));
+    }
+    // Regular file: allocate a loop for the whole image.
+    let abs = std::fs::canonicalize(image)
+        .map_err(|e| format!("failed to resolve image path: {e}"))?;
+    let abs_c = CString::new(abs.to_string_lossy().as_bytes())
+        .map_err(|_| "invalid image path".to_string())?;
+    let image_fd = unsafe { libc::open(abs_c.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if image_fd < 0 {
+        return Err(format!(
+            "failed to open image for loop setup: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let ctl_c = CString::new("/dev/loop-control").unwrap();
+    let ctl_fd = unsafe { libc::open(ctl_c.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if ctl_fd < 0 {
+        unsafe { libc::close(image_fd) };
+        return Err(format!(
+            "failed to open /dev/loop-control: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let dev_nr = unsafe { libc::ioctl(ctl_fd, 0x4C82 as _) };
+    unsafe { libc::close(ctl_fd) };
+    if dev_nr < 0 {
+        unsafe { libc::close(image_fd) };
+        return Err(format!(
+            "LOOP_CTL_GET_FREE failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut dev_nr = dev_nr as i32;
+    // GET_FREE may point past pre-created nodes (see connect.rs);
+    // fall back to an existing free loop node.
+    if !std::path::Path::new(&loop_node(dev_nr)).exists() {
+        let mut found: Option<i32> = None;
+        for nr in 0..256 {
+            let node = loop_node(nr);
+            if !std::path::Path::new(&node).exists() {
+                continue;
+            }
+            let bf = format!("/sys/block/loop{nr}/loop/backing_file");
+            match std::fs::read_to_string(&bf) {
+                Ok(content) if !content.trim().is_empty() => continue,
+                _ => {
+                    found = Some(nr);
+                    break;
+                }
+            }
+        }
+        if let Some(nr) = found {
+            dev_nr = nr;
+        }
+    }
+    let loop_fd = open_loop_node(dev_nr, libc::O_RDWR | libc::O_CLOEXEC);
+    if loop_fd < 0 {
+        unsafe { libc::close(image_fd) };
+        return Err(format!(
+            "failed to open {}: {}",
+            loop_node(dev_nr),
+            std::io::Error::last_os_error()
+        ));
+    }
+    if unsafe { libc::ioctl(loop_fd, 0x4C00 as _, image_fd) } < 0 {
+        let e = std::io::Error::last_os_error();
+        unsafe { libc::close(loop_fd) };
+        unsafe { libc::close(image_fd) };
+        return Err(format!("LOOP_SET_FD failed: {e}"));
+    }
+    // Whole-file backing: offset 0, sizelimit 0.
+    #[repr(C)]
+    struct LoopInfo64Lite {
+        lo_device: u64,
+        lo_inode: u64,
+        lo_rdevice: u64,
+        lo_offset: u64,
+        lo_sizelimit: u64,
+        lo_number: u32,
+        lo_encrypt_type: u32,
+        lo_encrypt_key_size: u32,
+        lo_flags: u32,
+        lo_file_name: [u8; 64],
+        lo_crypt_name: [u8; 64],
+        lo_encrypt_key: [u8; 32],
+        lo_init: [u64; 2],
+    }
+    let info: LoopInfo64Lite = unsafe { std::mem::zeroed() };
+    if unsafe { libc::ioctl(loop_fd, 0x4C04 as _, &info) } < 0 {
+        let e = std::io::Error::last_os_error();
+        unsafe { libc::ioctl(loop_fd, 0x4C01 as _, 0) };
+        unsafe { libc::close(loop_fd) };
+        unsafe { libc::close(image_fd) };
+        return Err(format!("LOOP_SET_STATUS64 failed: {e}"));
+    }
+    unsafe { libc::close(loop_fd) };
+    unsafe { libc::close(image_fd) };
+    Ok((loop_node(dev_nr), Some(dev_nr)))
+}
+
+fn clear_loop(nr: i32) {
+    let fd = open_loop_node(nr, libc::O_RDWR | libc::O_CLOEXEC);
+    if fd >= 0 {
+        unsafe { libc::ioctl(fd, 0x4C01 as _, 0) };
+        unsafe { libc::close(fd) };
     }
 }
 
@@ -326,18 +454,41 @@ pub fn run_map(args: MapArgs) -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
-    let data = match load_super(&args.image) {
-        Ok(d) => d,
+    let slot_filter = match parse_slot_filter(&args.slot) {
+        Ok(s) => s,
         Err(e) => {
             eprintln!("error: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
-
-    let p = match resolve_partition(&data, &args.partition, &args.slot) {
-        Ok(p) => p,
+    // Slot-aware: `-s b` maps from metadata slot 1, `all` searches all
+    // valid slots so `system_b` resolves on dual-slot images.
+    let datas = match split_util::load_for_slot_filter(&args.image, slot_filter) {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("error: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let (slot_pos, part_idx) =
+        match split_util::find_partition_across(&datas, &args.partition, slot_filter) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+    let data = match datas.get(slot_pos) {
+        Some(d) => d,
+        None => {
+            eprintln!("error: metadata slot not found");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let p = match data.partitions.get(part_idx).cloned() {
+        Some(p) => p,
+        None => {
+            eprintln!("error: invalid partition index");
             return std::process::ExitCode::FAILURE;
         }
     };
@@ -347,14 +498,16 @@ pub fn run_map(args: MapArgs) -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
-    let abs_image = match std::fs::canonicalize(&args.image) {
-        Ok(p) => p,
+    // dm-linear needs a block device. Regular files are backed by a
+    // whole-image loop automatically (old code passed the file path to
+    // the kernel -> ENODEV).
+    let (super_path, backing_loop) = match ensure_block_base(&args.image) {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("error: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
-    let super_path = abs_image.to_string_lossy().to_string();
 
     let readonly =
         (p.attributes & super_image_worker_core::LP_PARTITION_ATTR_READONLY != 0) && !args.force_writable;
@@ -401,6 +554,9 @@ pub fn run_map(args: MapArgs) -> std::process::ExitCode {
     if let Err(e) = dm_create_device(dm_fd, &p.name) {
         eprintln!("error creating dm device: {e}");
         unsafe { libc::close(dm_fd) };
+        if let Some(nr) = backing_loop {
+            clear_loop(nr);
+        }
         return std::process::ExitCode::FAILURE;
     }
 
@@ -408,6 +564,9 @@ pub fn run_map(args: MapArgs) -> std::process::ExitCode {
         eprintln!("error loading table: {e}");
         let _ = dm_remove_device(dm_fd, &p.name);
         unsafe { libc::close(dm_fd) };
+        if let Some(nr) = backing_loop {
+            clear_loop(nr);
+        }
         return std::process::ExitCode::FAILURE;
     }
 
@@ -415,6 +574,9 @@ pub fn run_map(args: MapArgs) -> std::process::ExitCode {
         eprintln!("error activating device: {e}");
         let _ = dm_remove_device(dm_fd, &p.name);
         unsafe { libc::close(dm_fd) };
+        if let Some(nr) = backing_loop {
+            clear_loop(nr);
+        }
         return std::process::ExitCode::FAILURE;
     }
 
@@ -422,6 +584,9 @@ pub fn run_map(args: MapArgs) -> std::process::ExitCode {
 
     let dm_path = format!("/dev/block/mapper/{}", p.name);
     println!("{dm_path}");
+    if let Some(nr) = backing_loop {
+        eprintln!("note: file-backed base loop {} kept for {dm_path}", loop_node(nr));
+    }
 
     std::process::ExitCode::SUCCESS
 }
@@ -444,17 +609,12 @@ pub fn run_unmap(args: UnmapArgs) -> std::process::ExitCode {
         }
     };
 
-    let flags = match dm_get_state(dm_fd, &args.partition) {
-        Ok(f) => f,
-        Err(_) => {
-            eprintln!("error: device '{}' not found", args.partition);
-            unsafe { libc::close(dm_fd) };
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-
-    if flags & DM_ACTIVE_PRESENT_FLAG == 0 {
-        eprintln!("error: device '{}' is not active", args.partition);
+    // Existence check: the device must answer DM_DEV_STATUS.
+    // (A previous ACTIVE_PRESENT bit check mis-detected freshly resumed
+    // devices as inactive; dmsetup-style remove works on any present
+    // device, active or suspended, so presence is the right gate.)
+    if dm_get_state(dm_fd, &args.partition).is_err() {
+        eprintln!("error: device '{}' not found", args.partition);
         unsafe { libc::close(dm_fd) };
         return std::process::ExitCode::FAILURE;
     }
