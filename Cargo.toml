@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/super-image-worker-core",
+    "crates/super-image-worker-cli",
+]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
