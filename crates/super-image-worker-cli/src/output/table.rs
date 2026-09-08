@@ -184,7 +184,7 @@ pub fn print_human(
     }
 }
 
-pub fn print_json(data: &SuperData, slot: Option<&str>) {
+pub fn json_value(data: &SuperData, slot: Option<&str>) -> serde_json::Value {
     let filtered = data.filter_by_slot(slot);
     let suffixes = data.available_suffixes();
 
@@ -233,7 +233,7 @@ pub fn print_json(data: &SuperData, slot: Option<&str>) {
         })
     }).collect();
 
-    let root = serde_json::json!({
+    serde_json::json!({
         "image_format": data.image_format,
         "image_size": data.image_size,
         "image_size_human": human_size(data.image_size),
@@ -251,6 +251,38 @@ pub fn print_json(data: &SuperData, slot: Option<&str>) {
         "devices": devices,
         "partitions": partitions,
         "extents": extents,
+    })
+}
+
+pub fn print_json(data: &SuperData, slot: Option<&str>) {
+    let root = json_value(data, slot);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&root).unwrap_or_else(|_| "{}".to_string())
+    );
+}
+
+/// Multi-slot JSON: single slot prints the plain object (backward
+/// compatible); several slots print `{"slots": [...]}` plus a merged
+/// partition count, mirroring `lpdump -a`.
+pub fn print_json_slots(datas: &[SuperData], slot: Option<&str>) {
+    if datas.len() == 1 {
+        if let Some(d) = datas.first() {
+            print_json(d, slot);
+        }
+        return;
+    }
+    let slots: Vec<serde_json::Value> =
+        datas.iter().map(|d| json_value(d, slot)).collect();
+    let total_partitions: usize = datas.iter().map(|d| d.partitions.len()).sum();
+    let first = datas.first();
+    let root = serde_json::json!({
+        "image_format": first.map(|d| d.image_format.clone()).unwrap_or_default(),
+        "image_size": first.map(|d| d.image_size).unwrap_or(0),
+        "metadata_slot_count": first.map(|d| d.geometry.metadata_slot_count).unwrap_or(0),
+        "slot_count": datas.len(),
+        "total_partitions": total_partitions,
+        "slots": slots,
     });
     println!(
         "{}",
