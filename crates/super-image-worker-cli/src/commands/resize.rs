@@ -1,5 +1,6 @@
+use super::split_util;
 use clap::Args;
-use super_image_worker_core::{LP_SECTOR_SIZE, LP_TARGET_TYPE_LINEAR, LpWriter, load_super};
+use super_image_worker_core::{LP_SECTOR_SIZE, LP_TARGET_TYPE_LINEAR, LpWriter};
 use std::fs::File;
 use std::path::PathBuf;
 
@@ -85,7 +86,18 @@ fn parse_size(s: &str) -> Result<u64, String> {
 
 #[allow(clippy::collapsible_if)]
 pub fn run(args: ResizeArgs) -> std::process::ExitCode {
-    let mut data = match load_super(&args.image) {
+    let slot_opt = match args.slot.as_str() {
+        "a" | "A" => Some("a"),
+        "b" | "B" => Some("b"),
+        "all" => None,
+        other => {
+            eprintln!("unknown slot: {other} (use a, b, all)");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    // Slot-aware: `system_b` (or `-s b`) edits metadata slot 1,
+    // so dual-slot images no longer hit "not found" via slot 0.
+    let mut data = match split_util::load_for_write(&args.image, &args.name, slot_opt) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("error: {e}");
@@ -106,15 +118,7 @@ pub fn run(args: ResizeArgs) -> std::process::ExitCode {
         }
     };
 
-    let slot = match args.slot.as_str() {
-        "a" | "A" => Some("a"),
-        "b" | "B" => Some("b"),
-        "all" => None,
-        other => {
-            eprintln!("unknown slot: {other} (use a, b, all)");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
+    let slot = slot_opt;
 
     let part_idx = match data.resolve_partition(&args.name, slot) {
         Ok(i) => i,
